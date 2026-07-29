@@ -476,6 +476,13 @@ enum BASSConfig {
         // output unit against the default .soloAmbient session, producing garbled or misrouted
         // audio on AirPods when a new build is installed over a running one.
         startNetworkMonitoring()
+        // Delete buffer segment WAVs orphaned by a previous run (a force-quit or crash while
+        // recording leaves the whole ring on disk — up to ~300 MB). The player is created once
+        // at app scope before any StreamBuffer exists, so there is nothing live to race with.
+        // Skipped under XCTest so StreamBufferTests' own segment files stay deterministic.
+        if ProcessInfo.processInfo.environment["XCTestBundlePath"] == nil {
+            DispatchQueue.global(qos: .utility).async { StreamBuffer.sweepStaleSegmentFiles() }
+        }
     }
 
     /// Initialize BASS against the current AVAudioSession. Called once from switchQuality()

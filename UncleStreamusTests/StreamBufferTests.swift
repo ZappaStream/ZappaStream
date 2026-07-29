@@ -156,5 +156,45 @@ final class StreamBufferTests: XCTestCase {
 
         XCTAssertEqual(buf.maxSegments, 20)
     }
+
+    // MARK: - sweepStaleSegmentFiles
+
+    func testSweep_removesSegmentFilesAndLeavesOthers() throws {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        // Index 42 stands in for a segment orphaned by lowering the buffer-minutes setting:
+        // a 0..<maxSegments loop would never reach it, the prefix sweep must.
+        let segments = [0, 7, 42].map {
+            tmp.appendingPathComponent("\(StreamBuffer.segmentFilePrefix)\($0).wav")
+        }
+        let unrelated = tmp.appendingPathComponent("unclestreamus_sweep_test_keepme.wav")
+        for url in segments + [unrelated] {
+            try Data([0x01, 0x02]).write(to: url)
+        }
+        defer { try? fm.removeItem(at: unrelated) }
+
+        StreamBuffer.sweepStaleSegmentFiles()
+
+        for url in segments {
+            XCTAssertFalse(fm.fileExists(atPath: url.path), "segment not swept: \(url.lastPathComponent)")
+        }
+        XCTAssertTrue(fm.fileExists(atPath: unrelated.path), "sweep deleted an unrelated file")
+    }
+
+    func testCleanup_removesSegmentFiles() throws {
+        let fm = FileManager.default
+        let buf = StreamBuffer(maxMinutes: 5)
+        buf.start()
+        Thread.sleep(forTimeInterval: 0.15)   // let the write queue open segment 0
+
+        let seg0 = fm.temporaryDirectory
+            .appendingPathComponent("\(StreamBuffer.segmentFilePrefix)0.wav")
+        XCTAssertTrue(fm.fileExists(atPath: seg0.path), "segment 0 was never created")
+
+        buf.stop()
+        buf.cleanup()
+
+        XCTAssertFalse(fm.fileExists(atPath: seg0.path))
+    }
 }
 #endif

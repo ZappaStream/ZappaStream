@@ -109,8 +109,21 @@ final class StreamBuffer {
 
     /// Delete all temporary WAV segment files.
     func cleanup() {
-        for i in 0..<maxSegments {
-            try? FileManager.default.removeItem(at: segmentPath(index: i))
+        Self.sweepStaleSegmentFiles()
+    }
+
+    /// Delete every DVR segment WAV in the temp directory, matched on the shared filename
+    /// prefix rather than `0..<maxSegments`. Prefix matching also catches high indices
+    /// orphaned by a lowered `dvrBufferMinutes` (30 → 5 leaves segments 5–29 behind) and
+    /// files left by a previous process that was force-quit mid-recording — up to ~300 MB
+    /// that would otherwise sit in tmp until iOS decides to purge it.
+    /// Called at launch from `BASSRadioPlayer.init()` and by `cleanup()`.
+    static func sweepStaleSegmentFiles() {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        guard let names = try? fm.contentsOfDirectory(atPath: tmp.path) else { return }
+        for name in names where name.hasPrefix(segmentFilePrefix) && name.hasSuffix(".wav") {
+            try? fm.removeItem(at: tmp.appendingPathComponent(name))
         }
     }
 
@@ -191,8 +204,11 @@ final class StreamBuffer {
 
     // MARK: - Private — Segment Management
 
+    /// Shared filename prefix for every on-disk segment; the sweep matches on it.
+    static let segmentFilePrefix = "zappastream_dvr_seg_"
+
     private func segmentPath(index: Int) -> URL {
-        tempDir.appendingPathComponent("zappastream_dvr_seg_\(index).wav")
+        tempDir.appendingPathComponent("\(Self.segmentFilePrefix)\(index).wav")
     }
 
     private func openSegment(index: Int) {
