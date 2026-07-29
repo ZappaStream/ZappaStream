@@ -406,7 +406,14 @@ extension BASSRadioPlayer {
             pauseTimestamp: dvrPauseTimestamp)
         dvrBufferFull = true
         streamBuffer?.stop()          // idempotent: StreamBuffer already stopped itself via stopBeforeSegmentIndex
-        // Stop metadata + state polling (includes FLAC health check) — no longer needed.
+        // Nothing is being recorded any more, so the pump has no purpose — it would just keep
+        // draining the pre-mixer (and, with the dead-source detection above, eventually
+        // "recover" a channel we deliberately pause below). The keepalive stays running: it is
+        // what keeps the lock-screen play affordance alive so the user can accept the offer.
+        stopDVRRecordingPump()
+        // Stop metadata + state polling (includes FLAC health check) — no longer needed, and
+        // with the download channel intentionally paused below the staleness watchdog could
+        // only ever false-positive and trigger pointless restarts.
         stopMetadataPolling()
         // Pause the live download channel for all formats to stop network activity.
         // goLive() will do a full stream restart (restartStream()) when wasBufferFull is true.
@@ -804,6 +811,7 @@ extension BASSRadioPlayer {
         stopDVRRecordingPump()
         guard preMixerHandle != 0 else { return }
         dvrPumpTickCount = 0
+        dvrPumpDeadTickCount = 0
         #if DEBUG
         dvrPumpLastTick = Date()
         #endif
@@ -825,6 +833,38 @@ extension BASSRadioPlayer {
             self.dvrPumpTickCount += 1
             self.dvrRecordingPumpBuf.withUnsafeMutableBytes { ptr in
                 _ = BASS_ChannelGetData(self.preMixerHandle, ptr.baseAddress!, DWORD(ptr.count))
+            }
+
+            // Dead-source detection. The pre-mixer carries BASS_MIXER_END, so it stops for good
+            // once the live download buffer runs dry (tunnel, Airplane Mode, dropped server).
+            // The pump then happily pulls nothing forever and the buffer stops growing with no
+            // other symptom. After ~1 s of consecutive STOPPED ticks, rebuild the live channel:
+            // partialRestartLiveChannel() preserves the DVR state and leaves the output mixer
+            // paused while we're .paused. Throttled to one attempt per 15 s so a genuinely
+            // offline device doesn't spin. preMixerHandle is re-read each tick, so the rebuilt
+            // handle is picked up automatically.
+            //
+            // Not for FLAC: partialRestartLiveChannel() can't rebuild the FLAC two-mixer
+            // pipeline in place and falls back to goLive() + a full restart, which would
+            // cancel the user's pause and start playing audio out loud — a nasty surprise
+            // from a backgrounded device. FLAC's dead-source case is still covered by
+            // checkStreamStatus while polling runs, and by the stale-resume gate on the
+            // next play press.
+            if BASS_ChannelIsActive(self.preMixerHandle) == DWORD(BASS_ACTIVE_STOPPED) {
+                self.dvrPumpDeadTickCount += 1
+            } else {
+                self.dvrPumpDeadTickCount = 0
+            }
+            if self.dvrPumpDeadTickCount >= 10, !self.isReconnecting, self.activeFormat != "FLAC" {
+                let now = ProcessInfo.processInfo.systemUptime
+                if now - self.dvrPumpLastRecoveryAttempt >= 15 {
+                    self.dvrPumpLastRecoveryAttempt = now
+                    self.dvrPumpDeadTickCount = 0
+                    #if DEBUG
+                    print("⚠️ DVR pump: pre-mixer STOPPED — partial restart of the live channel")
+                    #endif
+                    self.bassPollingQueue.async { [weak self] in self?.partialRestartLiveChannel() }
+                }
             }
             #if os(iOS)
             // Keepalive health check, every ~10 s. An AVAudioPlayer can be stopped by the

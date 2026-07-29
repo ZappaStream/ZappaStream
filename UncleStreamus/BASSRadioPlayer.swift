@@ -185,7 +185,14 @@ enum BASSConfig {
     // Pumps the decode-only pre-mixer while the output mixer is paused during DVR pause.
     // Keeps the recording DSP firing so WAV segments continue to be written to disk.
     var dvrRecordingPumpSource: DispatchSourceTimer?
-    var dvrRecordingPumpBuf = [UInt8](repeating: 0, count: 35280) // 100ms at 44.1kHz stereo float32
+    // 200 ms at 44.1 kHz stereo float32 — twice the 100 ms tick interval. The headroom lets a
+    // jittered or delayed tick pull the backlog and catch up; a buffer sized exactly to the
+    // tick could only ever fall further behind the wall clock.
+    var dvrRecordingPumpBuf = [UInt8](repeating: 0, count: 70560)
+    /// Consecutive pump ticks that found the pre-mixer STOPPED (dead live source).
+    var dvrPumpDeadTickCount: Int = 0
+    /// `systemUptime` of the last pump-driven recovery attempt; throttles the restarts.
+    var dvrPumpLastRecoveryAttempt: TimeInterval = 0
 
     /// Pump ticks since the pump last started (~10/s). Drives the periodic keepalive health
     /// check on iOS, so it is not DEBUG-only. Reset each time the pump starts.
