@@ -919,7 +919,6 @@ extension BASSRadioPlayer {
     /// even at volume 0.0 — this prevents suspension for tunnels longer than ~30s.
     /// Safe to call repeatedly; no-ops if already running.
     func startSilenceKeepalive() {
-        guard silenceKeepalivePlayer == nil else { return }
         #if os(iOS)
         // The keepalive only prevents *background* suspension. In the foreground iOS never suspends
         // us, and an active silent player makes iOS believe audio is rendering — which (because we
@@ -927,6 +926,15 @@ extension BASSRadioPlayer {
         // AirPods/lock-screen button to pauseCommand even while DVR-paused, silently breaking resume.
         guard !isAppInForeground else { return }
         #endif
+        // A player that exists but has stopped is worse than no player at all. An interruption
+        // (call, Siri, another app claiming the session) stops the AVAudioPlayer without nil-ing
+        // it, so the old `== nil` guard blocked every restart for the rest of the session — iOS
+        // then suspended us and the recording pump froze mid-pause. Rebuild a stopped player.
+        if let existing = silenceKeepalivePlayer {
+            guard !existing.isPlaying else { return }
+            existing.stop()
+            silenceKeepalivePlayer = nil
+        }
         guard let data = Self.silentWAVData,
               let player = try? AVAudioPlayer(data: data, fileTypeHint: AVFileType.wav.rawValue)
         else {
@@ -938,15 +946,59 @@ extension BASSRadioPlayer {
         player.numberOfLoops = -1
         player.volume = 0.0
         player.prepareToPlay()
-        player.play()
+        // play() returns false when the session isn't usable yet — typically right after an
+        // interruption ends, before the session has been reactivated. Best-effort reactivate
+        // and retry rather than silently leaving the app unprotected against suspension.
+        guard player.play() else {
+            #if DEBUG
+            print("⚠️ Silence keepalive: play() refused — reactivating session and retrying")
+            #endif
+            player.stop()
+            try? AVAudioSession.sharedInstance().setActive(true)
+            scheduleSilenceKeepaliveRetry()
+            return
+        }
         silenceKeepalivePlayer = player
+        silenceKeepaliveRetryCount = 0
         #if DEBUG
         print("🔇 Silence keepalive started — audio session stays alive during reconnect")
+        logDVRDiag("keepalive-start")
+        #endif
+    }
+
+    /// Retry a refused keepalive start up to 3 times, 1 s apart. Abandoned as soon as the
+    /// conditions that need it are gone (playback resumed, or we came back to the foreground).
+    private func scheduleSilenceKeepaliveRetry() {
+        guard silenceKeepaliveRetryCount < 3 else {
+            #if DEBUG
+            print("⚠️ Silence keepalive: giving up after \(silenceKeepaliveRetryCount) retries")
+            #endif
+            return
+        }
+        silenceKeepaliveRetryCount += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.dvrState == .paused, !self.isAppInForeground else { return }
+            self.startSilenceKeepalive()
+        }
+    }
+
+    /// Re-arm the keepalive after something outside our control may have killed it: an
+    /// interruption, a route change, or an AVAudioPlayer death we get no notification for.
+    /// Resets the retry budget — this is a new episode, not a continuation of the last burst.
+    /// No-op unless we're actually backgrounded, DVR-paused, and not already keeping alive.
+    func rearmSilenceKeepaliveIfNeeded() {
+        guard !isAppInForeground, dvrState == .paused else { return }
+        guard silenceKeepalivePlayer?.isPlaying != true else { return }
+        silenceKeepaliveRetryCount = 0
+        startSilenceKeepalive()
+        #if DEBUG
+        logDVRDiag("keepalive-rearm")
         #endif
     }
 
     /// Stop the silence keepalive. Called when real audio resumes or playback is explicitly stopped.
     func stopSilenceKeepalive() {
+        silenceKeepaliveRetryCount = 0   // cancels any in-flight retry burst
         guard let player = silenceKeepalivePlayer else { return }
         player.stop()
         silenceKeepalivePlayer = nil

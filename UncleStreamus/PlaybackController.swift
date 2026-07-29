@@ -649,9 +649,24 @@ final class PlaybackController {
             print("🔔 AVAudioSession interruption ENDED — shouldResume=\(opts.contains(.shouldResume)) dvrState=\(bassPlayer.dvrState) userIntendedPlay=\(bassPlayer.isUserIntendedPlay)")
             bassPlayer.logDVRDiag("interrupt-ended")
             #endif
+            // Deliberately only acted on with .shouldResume: without it the user chose other
+            // audio, and reactivating our non-mixable session would interrupt them. A pause
+            // left unprotected that way degrades gracefully — the stale-resume gate in
+            // dvrResume() sends the next play press straight to live instead of into a sliver.
             if opts.contains(.shouldResume) && bassPlayer.isUserIntendedPlay {
                 configureAudioSession()
-                bassPlayer.triggerImmediateReconnect()
+                // Re-arm the keepalive: the interruption stopped the silent player, and while
+                // we stay DVR-paused in the background nothing else would restart it — that is
+                // exactly how iOS ends up suspending us and freezing the recording pump.
+                bassPlayer.rearmSilenceKeepaliveIfNeeded()
+                // Skip the reconnect once the buffer is full: recording is intentionally over
+                // and the live channel is paused on purpose (the play-buffer-vs-go-live choice
+                // is offered on the next play press). Otherwise reconnect — while paused it
+                // routes to the buffer-preserving partialRestartLiveChannel(), which is what
+                // restores recording after a call.
+                if !(bassPlayer.dvrState == .paused && bassPlayer.dvrBufferFull) {
+                    bassPlayer.triggerImmediateReconnect()
+                }
             }
         }
     }
@@ -678,7 +693,9 @@ final class PlaybackController {
         case .playing:
             bassPlayer.dvrPausePlayback()
         case .paused:
-            break   // already paused
+            // Already paused — but a route change can stop the silent keepalive, and while
+            // backgrounded that leads to suspension and a frozen recording pump. Re-check it.
+            bassPlayer.rearmSilenceKeepaliveIfNeeded()
         }
     }
 
@@ -703,6 +720,9 @@ final class PlaybackController {
         try? session.setCategory(.playback, mode: .default, options: [.allowBluetoothA2DP, .allowAirPlay])
         try? session.setActive(true)
         bassPlayer.restartOutputAfterRouteChange()
+        // Same reasoning as the removal case: the route transition can have stopped the
+        // keepalive while we were background-paused. No-op unless it's actually needed.
+        bassPlayer.rearmSilenceKeepaliveIfNeeded()
     }
 
     // MARK: - Playback verbs

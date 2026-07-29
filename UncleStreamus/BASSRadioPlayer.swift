@@ -140,6 +140,10 @@ enum BASSConfig {
     /// iOS will not suspend an app with an active .playback session producing audio output,
     /// even at volume 0.0 — so this prevents suspension during tunnels > ~30s.
     var silenceKeepalivePlayer: AVAudioPlayer?
+    /// Attempts used by the current keepalive-start episode. `play()` can fail while the
+    /// session is still locked by an interruption that just ended; a short retry burst
+    /// covers that. Reset on success, on stop, and by `rearmSilenceKeepaliveIfNeeded()`.
+    var silenceKeepaliveRetryCount: Int = 0
     #endif
 
     /// Incremented by freeStream() each time handles are torn down. Captured by restartStream()
@@ -183,12 +187,15 @@ enum BASSConfig {
     var dvrRecordingPumpSource: DispatchSourceTimer?
     var dvrRecordingPumpBuf = [UInt8](repeating: 0, count: 35280) // 100ms at 44.1kHz stereo float32
 
+    /// Pump ticks since the pump last started (~10/s). Drives the periodic keepalive health
+    /// check on iOS, so it is not DEBUG-only. Reset each time the pump starts.
+    var dvrPumpTickCount: Int = 0
+
     #if DEBUG
     // Diagnostics for the DVR background-recording investigation (see plan
     // cosmic-doodling-sifakis). Track recording-pump liveness so we can detect when iOS
     // suspended the app (pump gap) vs the stream stalling. Reset each time the pump starts.
     var dvrPumpLastTick: Date = .distantPast
-    var dvrPumpTickCount: Int = 0
     #endif
 
     // 3s retry interval, giving up after 12 attempts (~1 minute total).

@@ -803,9 +803,9 @@ extension BASSRadioPlayer {
     func startDVRRecordingPump() {
         stopDVRRecordingPump()
         guard preMixerHandle != 0 else { return }
+        dvrPumpTickCount = 0
         #if DEBUG
         dvrPumpLastTick = Date()
-        dvrPumpTickCount = 0
         #endif
         let src = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
         src.schedule(deadline: .now() + 0.1, repeating: .milliseconds(100), leeway: .milliseconds(10))
@@ -821,11 +821,21 @@ extension BASSRadioPlayer {
                 print("⚠️ DVR pump gap of \(String(format: "%.1f", gap))s after \(self.dvrPumpTickCount) ticks (app likely suspended)")
             }
             self.dvrPumpLastTick = now
-            self.dvrPumpTickCount += 1
             #endif
+            self.dvrPumpTickCount += 1
             self.dvrRecordingPumpBuf.withUnsafeMutableBytes { ptr in
                 _ = BASS_ChannelGetData(self.preMixerHandle, ptr.baseAddress!, DWORD(ptr.count))
             }
+            #if os(iOS)
+            // Keepalive health check, every ~10 s. An AVAudioPlayer can be stopped by the
+            // system without any notification we observe, and a dead keepalive means iOS
+            // suspends the app and freezes this very pump. Costs one main-queue hop per 10 s.
+            if self.dvrPumpTickCount % 100 == 0 {
+                DispatchQueue.main.async { [weak self] in
+                    self?.rearmSilenceKeepaliveIfNeeded()
+                }
+            }
+            #endif
         }
         src.resume()
         dvrRecordingPumpSource = src
