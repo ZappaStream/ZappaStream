@@ -239,6 +239,35 @@ final class ShowTimeFetcherTests: XCTestCase {
         XCTAssertEqual(result, ["q: Duke Of Earl", "Wonderful Wino"])
     }
 
+    func testParseSetlist_standaloneBracketedNoteFoldedIntoPrecedingSong() {
+        // Regression for 1982 05 22 Düsseldorf: zappateers' source has a stray comma
+        // before the "[incl. ...]" note ("Let's Move To Cleveland, [incl. Is That All
+        // There Is?, G]") instead of attaching it directly, so "Is That All There Is?"
+        // was surfacing as its own bogus track.
+        let result = FZShowsFetcher.parseSetlist(
+            "Bamboozled By Love, Let's Move To Cleveland, [incl. Is That All There Is?, G], Tinsel Town Rebellion"
+        )
+        XCTAssertEqual(result, [
+            "Bamboozled By Love",
+            "Let's Move To Cleveland [incl. Is That All There Is?, G]",
+            "Tinsel Town Rebellion",
+        ])
+    }
+
+    func testParseSetlist_correctlyAttachedBracketedNote_notDoubleFolded() {
+        // "Song [incl. ...]" with no comma before the bracket is already one entry;
+        // folding must not touch it.
+        let result = FZShowsFetcher.parseSetlist(
+            "Zoot Allures [incl. When No One Was No One, G], Sofa"
+        )
+        XCTAssertEqual(result, ["Zoot Allures [incl. When No One Was No One, G]", "Sofa"])
+    }
+
+    func testParseSetlist_standaloneBracketedNoteAtStart_keptAsOwnEntry() {
+        let result = FZShowsFetcher.parseSetlist("[incl. Foo, G], Wonderful Wino")
+        XCTAssertEqual(result, ["[incl. Foo, G]", "Wonderful Wino"])
+    }
+
     // MARK: - FZShowsFetcher.redrivedSetlist (cache migration helper)
 
     func testRedrivedSetlist_foldsStandaloneQuoteFromOldlySplitArray() {
@@ -332,6 +361,57 @@ final class ShowTimeFetcherTests: XCTestCase {
         XCTAssertFalse(show?.setlist.contains("King Kong") ?? true)
     }
 
+    func testParseShowFromHTML_earlyShowUnclosedSetlistTag_stillParses() {
+        // Regression for 1976 10 24 (E) Boston Music Hall: zappateers' source HTML
+        // omits the closing </p> on the Early show's setlist, so the only terminator
+        // left is the sibling <h5>Late show</h5> — which selectTargetSection already
+        // strips out of the Early subsection. parseSetlistAndAcronyms must fall back
+        // to the end of the (already-bounded) target section instead of returning nil.
+        let html = """
+        <h4>1976 10 24 - Boston Music Hall, Boston, MA</h4>
+        <h5>Early show</h5>
+        <h6>105 min, Aud, A/A-</h6>
+        <p class="note">The better sounding recording ends after Dinah-Moe Humm.</p>
+        <p class="setlist">The Purple Lagoon, Stinkfoot, Advance Romance (q: In-A-Gadda-Da-Vida), Muffin Man.
+        <h5>Late show</h5>
+        <h6>110 min, Aud, B+</h6>
+        <p class="setlist">The Purple Lagoon, Stinkfoot, Advance Romance, Muffin Man</p>
+        <h4>1976 10 27 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "7677.html",
+            searchDate: "1976 10 24", originalDate: "1976 10 24",
+            showTime: .early, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertNotNil(show)
+        XCTAssertNotEqual(show?.setlist, ["No setlist available"])
+        XCTAssertTrue(show?.setlist.contains("Advance Romance (q: In-A-Gadda-Da-Vida)") ?? false)
+        XCTAssertTrue(show?.setlist.contains(where: { $0.hasPrefix("Muffin Man") }) ?? false)
+        // Only the Early section's songs, not the Late show's.
+        XCTAssertEqual(show?.setlist.count, 4)
+    }
+
+    func testParseShowFromHTML_dusseldorfStrayCommaBeforeBracketedNote() {
+        // Regression for 1982 05 22 Philipshalle, Düsseldorf: source HTML has
+        // "Let's Move To Cleveland, [incl. Is That All There Is?, G]" — the stray
+        // comma must not surface "Is That All There Is?" as its own track.
+        let html = """
+        <h4>1982 05 22 - Philipshalle, Düsseldorf, Germany</h4>
+        <h6>130 min, Aud, B+</h6>
+        <p class="setlist">Bamboozled By Love, Let's Move To Cleveland, [incl. Is That All There Is?, <acronym title="Guitar">G</acronym>], Tinsel Town Rebellion</p>
+        <h4>1982 05 23 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "8182.html",
+            searchDate: "1982 05 22", originalDate: "1982 05 22",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertNotNil(show)
+        XCTAssertFalse(show?.setlist.contains("Is That All There Is?") ?? true)
+        XCTAssertTrue(show?.setlist.contains("Let's Move To Cleveland [incl. Is That All There Is?, G]") ?? false)
+        XCTAssertEqual(show?.setlist.count, 3)
+    }
+
     func testParseShowFromHTML_acronymExtraction() {
         let html = """
         <h4>1973 11 07 - Theater, Chicago, IL</h4>
@@ -411,5 +491,211 @@ final class ShowTimeFetcherTests: XCTestCase {
         )
         // date should be originalDate, not searchDate
         XCTAssertEqual(show?.date, "1972 12 31")
+    }
+
+    // MARK: - extractBandInfo (via parseShowFromHTML)
+
+    func testParseShowFromHTML_bandInfo_scopedBlockDoesNotBleedAcrossH2Section() {
+        // Regression for 1977 02 03 Pavillon De Paris, Paris: the December-1976-only
+        // NY band block must not bleed into the following European leg, which defines
+        // no block of its own and should fall back to the base Oct76-Feb77 block.
+        let html = """
+        <h3>Frank Zappa's Band, October 1976 - February 1977</h3>
+        <p class="band">FZ, Ray White, Patrick O'Hearn, Terry Bozzio, Eddie Jobson, Bianca Thornton (through November 11).</p>
+        <h2 id="NA">October - November 1976 US and Canada tour</h2>
+        <h4>1976 10 24 - Some Venue, City, ST</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h2 id="NY">December 1976 Christmas in New York</h2>
+        <h3>Frank Zappa's Band, December 1976</h3>
+        <p class="band">FZ, Ray White, Ruth Underwood, Dave Samuels, Mike Brecker, Randy Brecker, Lou Marini, Ron Cuber, Tom Malone.</p>
+        <h4>1976 12 26 - Palladium, New York, NY</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h2 id="EU">January - February 1977 European tour</h2>
+        <h4>1977 02 03 - Pavillon De Paris, Paris, France</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1977 02 04 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "7677.html",
+            searchDate: "1977 02 03", originalDate: "1977 02 03",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertNotNil(show?.bandInfo)
+        XCTAssertTrue(show?.bandInfo?.contains("Eddie Jobson") ?? false)
+        XCTAssertFalse(show?.bandInfo?.contains("Ron Cuber") ?? true)
+        XCTAssertTrue(show?.bandInfo?.hasPrefix("Frank Zappa's Band, October 1976 - February 1977") ?? false)
+    }
+
+    func testParseShowFromHTML_bandInfo_prefacingBlockPersistsAcrossMultipleH2Legs() {
+        // A block sitting at the tail of its section (no <h4> before the next <h2>)
+        // must keep applying across several subsequent bare <h2> legs with no block
+        // of their own — mirrors 7374.html's April-May 1974 -> June-Dec 1974 case.
+        let html = """
+        <h2 id="AprMay">April - May 1974</h2>
+        <h3>Frank Zappa's Band, April 1974</h3>
+        <p class="band">FZ, Napoleon Murphy Brock, George Duke, Tom Fowler, Ralph Humphrey.</p>
+        <h4>1974 04 15 - Venue A, City, ST</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h3>Frank Zappa's Band, May 1974</h3>
+        <p class="band">FZ, Napoleon Murphy Brock, George Duke, Tom Fowler, Ralph Humphrey, Chester Thompson.</p>
+        <h2 id="JunAug">June - August 1974</h2>
+        <h2 id="SepOct">September - October 1974</h2>
+        <h2 id="OctDec">October - December 1974</h2>
+        <h4>1974 11 02 - Venue B, City, ST</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1974 11 03 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "7374.html",
+            searchDate: "1974 11 02", originalDate: "1974 11 02",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertNotNil(show?.bandInfo)
+        XCTAssertTrue(show?.bandInfo?.contains("Chester Thompson") ?? false)
+        XCTAssertTrue(show?.bandInfo?.hasPrefix("Frank Zappa's Band, May 1974") ?? false)
+    }
+
+    func testParseShowFromHTML_bandInfo_persistsAcrossOneH2WithNoOwnBlock() {
+        let html = """
+        <h3>Frank Zappa's Band, 1988</h3>
+        <p class="band">FZ, Ike Willis, Mike Keneally, Bobby Martin.</p>
+        <h2 id="leg1">Leg One</h2>
+        <h4>1988 02 01 - Venue A, City, ST</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1988 02 02 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "88.html",
+            searchDate: "1988 02 01", originalDate: "1988 02 01",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertTrue(show?.bandInfo?.contains("Mike Keneally") ?? false)
+    }
+
+    func testParseShowFromHTML_bandInfo_sameSectionNoBoundaryCrossed() {
+        let html = """
+        <h2 id="leg1">Leg One</h2>
+        <h3>Frank Zappa's Band, 1988</h3>
+        <p class="band">FZ, Ike Willis, Mike Keneally, Bobby Martin.</p>
+        <h4>1988 02 01 - Venue A, City, ST</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1988 02 02 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "88.html",
+            searchDate: "1988 02 01", originalDate: "1988 02 01",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertTrue(show?.bandInfo?.contains("Bobby Martin") ?? false)
+    }
+
+    func testParseShowFromHTML_bandInfo_noBandBlock_returnsNil() {
+        let html = """
+        <h4>1973 11 07 - Auditorium Theater, Chicago, IL</h4>
+        <h6>90 min, SBD, A</h6>
+        <p class="setlist">Montana, Cosmik Debris, Camarillo Brillo</p>
+        <h4>1973 11 08 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "73.html",
+            searchDate: "1973 11 07", originalDate: "1973 11 07",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertNil(show?.bandInfo)
+    }
+
+    func testParseShowFromHTML_bandInfo_nonDateH4CrossReferenceStillScopesBlock() {
+        // A non-date cross-reference <h4> (e.g. "Sources for official released
+        // recordings...") must still count as "real content in this section" so the
+        // Dec-1976-style block is correctly classified scoped, not prefacing.
+        let html = """
+        <h3>Frank Zappa's Band, October 1976 - February 1977</h3>
+        <p class="band">FZ, Ray White, Patrick O'Hearn, Terry Bozzio, Eddie Jobson, Bianca Thornton.</p>
+        <h2 id="NY">December 1976 Christmas in New York</h2>
+        <h3>Frank Zappa's Band, December 1976</h3>
+        <p class="band">FZ, Ray White, Ruth Underwood, Mike Brecker.</p>
+        <h4 class="wrongdate">  &diams; <a href="somewhere.html">Sources for this show</a></h4>
+        <h2 id="EU">January - February 1977 European tour</h2>
+        <h4>1977 02 03 - Pavillon De Paris, Paris, France</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1977 02 04 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "7677.html",
+            searchDate: "1977 02 03", originalDate: "1977 02 03",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertTrue(show?.bandInfo?.contains("Eddie Jobson") ?? false)
+        XCTAssertFalse(show?.bandInfo?.contains("Mike Brecker") ?? true)
+    }
+
+    func testParseShowFromHTML_bandInfo_blockWithInnerMarkupIsStillMatched() {
+        // Regression for rehearsals.html's September 1981 - July 1982 block: its
+        // members line ends in "<br>Note: ...", which a `[^<]*` capture skips over
+        // entirely — handing every 1981+ rehearsal the stale 1980 lineup sitting
+        // further up the page. The block must be matched, its <br> kept as a line
+        // break, and the trailing note preserved.
+        let html = """
+        <h3>Frank Zappa's Band, November - December 1980</h3>
+        <p class="band">FZ, Ike Willis, Steve Vai, Ray White, Arthur Barrow, Vinnie Colaiuta.</p>
+        <h2 id="r80">September - October 1980 Los Angeles, CA</h2>
+        <h4>1980 09 20 - Rehearsal</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h3><a id="r81"></a>Frank Zappa's band, September 1981 - July 1982</h3>
+        <p class="band">FZ, Steve Vai, Ray White, Scott Thunes, Chad Wackerman.<br>
+        Note: a few of the August 1981 tapes feature someone else.</p>
+        <h2 id="r81b">August - September 1981 Los Angeles, CA</h2>
+        <h4>1981 08 06 - Rehearsal</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1981 08 07 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "rehearsals.html",
+            searchDate: "1981 08 06", originalDate: "1981 08 06",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertTrue(show?.bandInfo?.contains("Chad Wackerman") ?? false)
+        XCTAssertFalse(show?.bandInfo?.contains("Vinnie Colaiuta") ?? true)
+        XCTAssertTrue(show?.bandInfo?.contains("Note: a few of the August 1981 tapes") ?? false)
+        // <br> survives as a line break rather than gluing the note onto the lineup.
+        XCTAssertFalse(show?.bandInfo?.contains("Wackerman.Note:") ?? true)
+    }
+
+    func testParseShowFromHTML_bandInfo_titleHeadingWithAnchorIsUsed() {
+        // Regression for 7374.html / rehearsals.html: the band-title <h3> wraps an
+        // <a id="…"> anchor, so a `[^<]+` capture misses it and the title falls back
+        // to an older heading — labelling the right lineup with the wrong date range.
+        let html = """
+        <h3>The Mothers Of Invention, April - May 1974</h3>
+        <p class="band">FZ, Napoleon Murphy Brock, George Duke, Ruth Underwood.</p>
+        <h2 id="leg1">April - May 1974</h2>
+        <h4>1974 05 08 - Venue A, City, ST</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h3 style="margin-top: 3em;"><a id="jd74"></a>The Mothers Of Invention, June - December 1974</h3>
+        <p class="band">FZ, Napoleon Murphy Brock, George Duke, Ruth Underwood, Chester Thompson.</p>
+        <h2 id="leg2">June - December 1974</h2>
+        <h4>1974 07 05 - Venue B, City, ST</h4>
+        <h6>info</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1974 07 06 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "7374.html",
+            searchDate: "1974 07 05", originalDate: "1974 07 05",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertTrue(show?.bandInfo?.hasPrefix("The Mothers Of Invention, June - December 1974") ?? false)
+        XCTAssertTrue(show?.bandInfo?.contains("Chester Thompson") ?? false)
     }
 }
