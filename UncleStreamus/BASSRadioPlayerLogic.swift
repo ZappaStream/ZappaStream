@@ -242,6 +242,52 @@ enum BASSRadioPlayerLogic {
         return max(0, bufferedDuration - currentRecordingTime)
     }
 
+    // MARK: - Stale-Resume Decision
+
+    /// What a play press should do when the buffer has been paused for a while.
+    enum DVRResumeAction: Equatable {
+        /// Normal path — play the buffered audio from the pause point.
+        case resumeFromBuffer
+        /// The buffer holds only a sliver relative to how long the user was away
+        /// (recording froze); discard it and go straight back to live.
+        case goLiveStale
+    }
+
+    /// Wall-clock/recording divergence beyond which a pause is a candidate for staleness.
+    static let dvrStaleGapSeconds: Double = 120
+    /// Fraction of wall time that must have been recorded for the buffer to count as healthy.
+    static let dvrStaleRecordedRatio: Double = 0.5
+
+    /// Decide whether a paused buffer is still worth resuming into.
+    ///
+    /// A backgrounded pause depends on the silence keepalive to stop iOS suspending the app;
+    /// when that dies (an interruption the app never recovered from), the recording pump
+    /// freezes and the buffer stops growing while wall time keeps running. Pressing play
+    /// then yields a few seconds of audio followed by an end-of-buffer retry storm and a
+    /// fall-through to live — the "confused" resume. Detecting it up front and going
+    /// straight to live is strictly better.
+    ///
+    /// Staleness needs **both** conditions:
+    /// - an absolute gap (`wall − recorded > 120 s`), so short pauses are never touched, and
+    /// - a ratio miss (`recorded < 0.5 × wall`), so an overnight pause on a flaky network —
+    ///   which loses chunks but still holds hours of valid audio — stays resumable.
+    ///
+    /// `bufferIsFull` overrides everything: a full ring stopped recording on purpose, so the
+    /// gap is expected and the buffer is complete. Keep the existing offer/drain flow.
+    /// Negative inputs (clock changes, an unset pause time) clamp to zero and read as healthy.
+    static func dvrResumeAction(wallSecondsSincePause: Double,
+                                recordedSecondsSincePause: Double,
+                                bufferIsFull: Bool,
+                                staleGapSeconds: Double = dvrStaleGapSeconds,
+                                staleRecordedRatio: Double = dvrStaleRecordedRatio) -> DVRResumeAction {
+        guard !bufferIsFull else { return .resumeFromBuffer }
+        let wall     = max(0, wallSecondsSincePause)
+        let recorded = max(0, recordedSecondsSincePause)
+        let gapIsLarge   = wall - recorded > staleGapSeconds
+        let recordedThin = recorded < staleRecordedRatio * wall
+        return gapIsLarge && recordedThin ? .goLiveStale : .resumeFromBuffer
+    }
+
     /// The ring-buffer segment index containing `pauseTimestamp` (floor via truncation;
     /// timestamps are non-negative). Guards a zero `segmentDuration` defensively — in
     /// practice it's a fixed 60 s and never zero.
