@@ -374,6 +374,10 @@ enum BASSConfig {
     var dvrPausedStreams:   [DWORD]        = []  // streams kept alive during dvrPausePlayback() fade-out
     var dvrPauseTimestamp:  Double         = 0
     var dvrPauseWallTime:   Date           = .distantPast  // wall clock when DVR was (re-)paused
+    /// `streamBuffer.bufferedDuration` at the moment of the pause. Subtracting it from the
+    /// current value gives how much was actually recorded while paused, which compared against
+    /// elapsed wall time is what detects a frozen recording pump (see `dvrResume()`).
+    var dvrPauseBufferedAtPause: Double    = 0
     var dvrPauseOffset:     Double         = 0             // behindLiveSeconds at the moment of pause
     var dvrCurrentSegNum:   Int            = 0
     var dvrNextSegNum:      Int            = 0

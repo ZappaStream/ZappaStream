@@ -73,6 +73,7 @@ extension BASSRadioPlayer {
         guard mixerHandle != 0, preMixerHandle != 0 else { return }
 
         dvrPauseTimestamp = streamBuffer?.currentTimestamp ?? 0
+        dvrPauseBufferedAtPause = streamBuffer?.bufferedDuration ?? 0
         dvrState = .paused
         startBehindTimer()   // begin counting up how far behind live the user is
 
@@ -137,6 +138,7 @@ extension BASSRadioPlayer {
         dvrMetadataTimer = nil
 
         dvrPauseTimestamp = currentRecordingTime
+        dvrPauseBufferedAtPause = buffer.bufferedDuration
         dvrState = .paused   // prevents handleDVRStreamEndMixtime from advancing the segment
         startBehindTimer()
 
@@ -180,21 +182,50 @@ extension BASSRadioPlayer {
             #endif
             return
         }
-        // Mark the full-buffer episode as draining so a later mid-drain pause/resume
-        // (which also lands in dvrState == .paused) won't re-prompt the play-vs-live choice.
-        if dvrBufferFull { dvrFullBufferDrainStarted = true }
-        stopDVRRecordingPump()
-        #if os(iOS)
-        stopSilenceKeepalive()   // real DVR audio takes over as the keepalive
-        #endif
+        // Staleness gate. If recording froze while we were backgrounded (the keepalive died
+        // and iOS suspended us), the buffer holds only a few seconds against hours of wall
+        // clock. Playing that sliver gives ~5-10 s of audio, an end-of-buffer retry storm and
+        // an eventual fall-through to live — so skip straight to live instead. Placed inside
+        // dvrResume() so every entry point (remote commands, resumeOrOfferBuffer, both
+        // ContentViews) is covered.
+        let wallSincePause = dvrPauseWallTime == .distantPast
+            ? 0 : Date().timeIntervalSince(dvrPauseWallTime)
+        let recordedSincePause = max(0, buffer.bufferedDuration - dvrPauseBufferedAtPause)
+        if BASSRadioPlayerLogic.dvrResumeAction(wallSecondsSincePause: wallSincePause,
+                                                recordedSecondsSincePause: recordedSincePause,
+                                                bufferIsFull: dvrBufferFull) == .goLiveStale {
+            #if DEBUG
+            print("⏱️ DVR resume: buffer is stale (wall=\(Int(wallSincePause))s recorded=\(Int(recordedSincePause))s) — going live")
+            logDVRDiag("resume-stale")
+            #endif
+            // Full restart: after hours suspended the live BASS stream is dead, so the
+            // fade-in path would produce silence rather than audio.
+            goLive(forceFullRestart: true)
+            return
+        }
 
         let stream = buffer.createPlaybackStream(from: dvrPauseTimestamp)
         guard stream != 0 else {
             #if DEBUG
             print("❌ DVR: failed to create playback stream at t=\(dvrPauseTimestamp)")
+            logDVRDiag("resume-failed")
             #endif
+            // The buffer is unplayable. Returning here would leave the player latched in
+            // .paused with no audio and no way out but another play press, so go live —
+            // strictly better than a dead state.
+            goLive()
             return
         }
+
+        // Only now that a playable stream exists: mark the full-buffer episode as draining
+        // (so a later mid-drain pause/resume won't re-prompt the play-vs-live choice) and
+        // hand recording duty back over. Both must happen before the mixer is unpaused
+        // below, so the pump and the mixer never pull from the pre-mixer at the same time.
+        if dvrBufferFull { dvrFullBufferDrainStarted = true }
+        stopDVRRecordingPump()
+        #if os(iOS)
+        stopSilenceKeepalive()   // real DVR audio takes over as the keepalive
+        #endif
 
         dvrPlaybackStream = stream
         dvrCurrentSegNum  = BASSRadioPlayerLogic.dvrSegmentIndex(pauseTimestamp: dvrPauseTimestamp,
@@ -267,7 +298,11 @@ extension BASSRadioPlayer {
 
     /// Exit DVR mode and return to the live stream immediately.
     /// The live stream is unmuted with a fade-in.
-    func goLive() {
+    ///
+    /// - Parameter forceFullRestart: Discard the buffer and rebuild the live stream from
+    ///   scratch instead of fading the existing one back in. Used by the stale-resume path,
+    ///   where the live stream has been dead for hours and a fade-in would yield silence.
+    func goLive(forceFullRestart: Bool = false) {
         guard dvrState != .live else { return }
         stopDVRRecordingPump()
         #if os(iOS)
@@ -311,18 +346,26 @@ extension BASSRadioPlayer {
         let wasBufferFull = dvrBufferFull
         dvrReturnOfferPending = false
         dvrFullBufferDrainStarted = false
-        if dvrBufferFull {
+        if dvrBufferFull || forceFullRestart {
             dvrBufferFull = false
+            streamBuffer?.stop()          // no-op if the ring already stopped itself
             streamBuffer?.cleanup()       // delete the preserved WAV segment files
             let dvrMins = UserDefaults.standard.integer(forKey: "dvrBufferMinutes")
             streamBuffer = StreamBuffer(maxMinutes: dvrMins > 0 ? dvrMins : 15)
             streamBuffer?.start()
+        } else {
+            // Lift the stop-before protection armed at pause time. Only dvrResume() used to
+            // clear it, so pause → Go Live left the ring armed to stop cleanly the next time
+            // it wrapped to that segment — recording would silently freeze later in the
+            // session, long after the pause that caused it.
+            streamBuffer?.clearStopBeforeSegment()
         }
 
         // FLAC always restarts from scratch. Non-FLAC also restarts when the live stream was
-        // paused (buffer-full): the paused channel has no usable download buffer, so a fresh
-        // connect is identical to a normal play-from-stopped experience.
-        if activeFormat == "FLAC" || wasBufferFull {
+        // paused (buffer-full) or when the caller forced it (stale resume): the paused or
+        // long-suspended channel has no usable download buffer, so a fresh connect is
+        // identical to a normal play-from-stopped experience.
+        if activeFormat == "FLAC" || wasBufferFull || forceFullRestart {
             bassPollingQueue.async { [weak self] in self?.restartStream() }
             #if DEBUG
             print("📡 DVR → LIVE (full restart)")
