@@ -98,6 +98,54 @@ class FZShowsFetcher {
         pattern: #"<h3[^>]*>([^<]+)</h3>"#
     )
 
+    /// Matches any `<h2` tag opening (tour-leg section boundary), regardless of
+    /// attributes. Used by `extractBandInfo` to scope `<p class="band">` blocks.
+    private static let h2TagStartRegex = try! NSRegularExpression(pattern: "<h2")
+
+    /// Matches any `<h4` tag opening, regardless of attributes/content — deliberately
+    /// NOT anchored to a date like `nextShowDatePattern`, since a non-date
+    /// cross-reference `<h4>` (or a `<h4 class="wrongdate">`) still counts as "real
+    /// content in this section" for `extractBandInfo`'s scoping logic.
+    private static let h4TagStartRegex = try! NSRegularExpression(pattern: "<h4")
+
+    /// Matches a whole `<p class="band">…</p>` block and captures its inner HTML.
+    ///
+    /// Deliberately tolerates inner markup (`(?:(?!</p>|<h[1-6]).)*` rather than a
+    /// naive `[^<]*`): `rehearsals.html`'s September 1981 - July 1982 block carries a
+    /// `<br>` plus a trailing "Note:" line, and a `[^<]*` capture skips it entirely —
+    /// which used to hand every 1981+ rehearsal the wrong lineup. The lookahead keeps
+    /// an unclosed `<p>` from running away past the next heading into a later section.
+    /// Callers run the capture through `plainText(fromInnerHTML:)`.
+    private static let bandBlockRegex = try! NSRegularExpression(
+        pattern: #"<p class="band">((?:(?!</p>|<h[1-6]).)*)</p>"#,
+        options: [.dotMatchesLineSeparators]
+    )
+
+    /// Matches an `<h3>` and captures its inner HTML, tolerating nested markup — the
+    /// band-title headings on `7374.html` and `rehearsals.html` wrap an `<a id="…">`
+    /// anchor, which `h3ContentRegex`'s `[^<]+` capture cannot match.
+    ///
+    /// Kept separate from `h3ContentRegex` on purpose: that one also feeds
+    /// `scanLatestH3DateRange` (tour naming), and widening it there would change the
+    /// `tour` field as a side effect of a band-info fix. Only `extractBandInfo` uses this.
+    private static let h3TitleRegex = try! NSRegularExpression(
+        pattern: #"<h3[^>]*>((?:(?!</h3>).)*)</h3>"#,
+        options: [.dotMatchesLineSeparators]
+    )
+
+    /// Reduces a captured inner-HTML fragment to display text: `<br>` becomes a line
+    /// break, every other tag is dropped, entities are decoded, and runs of blank
+    /// lines collapse to one.
+    private static func plainText(fromInnerHTML html: String) -> String {
+        html
+            .replacingOccurrences(of: #"<br\s*/?>"#, with: "\n",
+                                  options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .decodeHTMLEntities()
+            .replacingOccurrences(of: #"\n{2,}"#, with: "\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static let userAgentString: String = {
         #if os(macOS)
         let platform = "macOS"
@@ -941,51 +989,90 @@ class FZShowsFetcher {
         return shows
     }
 
+    /// A single `<p class="band">...</p>` match: its full range plus decoded/trimmed text.
+    private struct BandBlock {
+        let range: Range<String.Index>
+        let text: String
+    }
+
+    /// Collects every `<p class="band">...</p>` block in `text`, in document order.
+    private static func collectBandBlocks(in text: String) -> [BandBlock] {
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return Self.bandBlockRegex.matches(in: text, range: nsRange).compactMap { match in
+            guard let fullRange = Range(match.range(at: 0), in: text),
+                  let contentRange = Range(match.range(at: 1), in: text) else { return nil }
+            return BandBlock(range: fullRange, text: plainText(fromInnerHTML: String(text[contentRange])))
+        }
+    }
+
+    /// Collects the start position of every match of `regex` in `text`, in document order.
+    private static func tagStartIndices(matching regex: NSRegularExpression, in text: String) -> [String.Index] {
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: nsRange).compactMap { Range($0.range, in: text)?.lowerBound }
+    }
+
     /// Extracts the band lineup from the HTML structure before the show date.
-    /// Looks for the last <p class="band">...</p> block before the show's <h4> tag,
-    /// and the <h3> immediately preceding it for the band/period title.
-    /// Returns "{h3 title}\n{members}" or nil if no band block found.
+    ///
+    /// A page can contain multiple `<p class="band">` blocks across `<h2>` tour-leg
+    /// sections. Some persist forward as the default lineup until superseded (e.g. a
+    /// mid-tour personnel change); others are a one-off scoped to a single short run
+    /// (e.g. an expanded horn section for one week of shows) and must NOT bleed into
+    /// later, unrelated tour legs that don't define their own block.
+    ///
+    /// A block is classified by what immediately follows it: if no `<h4>` (show or
+    /// cross-reference heading) appears before the next `<h2>` section boundary, the
+    /// block was never actually "used" within its own section and is treated as a
+    /// persisting default; otherwise it's scoped to just that section. Resolution
+    /// walks blocks backward from the show, using the nearest one that either shares
+    /// the show's section or is a persisting default.
+    ///
+    /// Known limitation (not handled): a persisting default can still incorrectly
+    /// bleed into a much later, structurally unrelated `<h2>` section that itself
+    /// defines no block and has no nearer override to stop it (e.g. `rehearsals.html`'s
+    /// "September 1981 - July 1982" band bleeding into a "Late 1987" section). Fixing
+    /// that would require parsing the free-text date ranges in `<h3>` titles.
+    ///
+    /// Returns "{h3 title}\n{members}" or nil if no applicable band block is found.
     private static func extractBandInfo(html: String, beforeIndex: String.Index) -> String? {
         let precedingHTML = String(html[html.startIndex..<beforeIndex])
 
-        // Find all <p class="band">...</p> matches, keep track of the last one
-        var lastBandRange: Range<String.Index>? = nil
-        var lastBandContent: String? = nil
+        let bandBlocks = collectBandBlocks(in: precedingHTML)
+        guard !bandBlocks.isEmpty else { return nil }
 
-        let bandPattern = #"<p class="band">([^<]*)</p>"#
-        if let regex = try? NSRegularExpression(pattern: bandPattern, options: []) {
-            let nsRange = NSRange(precedingHTML.startIndex..<precedingHTML.endIndex, in: precedingHTML)
-            regex.enumerateMatches(in: precedingHTML, range: nsRange) { match, _, _ in
-                guard let match = match,
-                      let fullRange = Range(match.range(at: 0), in: precedingHTML),
-                      let contentRange = Range(match.range(at: 1), in: precedingHTML) else { return }
-                lastBandRange = fullRange
-                lastBandContent = String(precedingHTML[contentRange])
-                    .decodeHTMLEntities()
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+        let h2Starts = tagStartIndices(matching: Self.h2TagStartRegex, in: precedingHTML)
+        let h4Starts = tagStartIndices(matching: Self.h4TagStartRegex, in: precedingHTML)
+
+        var winner: BandBlock? = nil
+        for block in bandBlocks.reversed() {
+            guard let nextH2 = h2Starts.first(where: { $0 > block.range.upperBound }) else {
+                // No <h2> between this block and the show: same section, use it.
+                winner = block
+                break
             }
+            let h4Intervenes = h4Starts.contains { $0 > block.range.upperBound && $0 < nextH2 }
+            if !h4Intervenes {
+                // Nothing used this block within its own section: it's a persisting default.
+                winner = block
+                break
+            }
+            // Scoped to its own (different) section; keep searching further back.
         }
 
-        guard let bandRange = lastBandRange, let membersText = lastBandContent, !membersText.isEmpty else {
+        guard let bandRange = winner?.range, let membersText = winner?.text, !membersText.isEmpty else {
             return nil
         }
 
-        // Find the last <h3> before the band block for the title
+        // Find the last <h3> before the winning band block for the title
         let beforeBand = String(precedingHTML[precedingHTML.startIndex..<bandRange.lowerBound])
         var titleText: String? = nil
 
-        let regex = Self.h3ContentRegex
-        do {
-            let nsRange = NSRange(beforeBand.startIndex..<beforeBand.endIndex, in: beforeBand)
-            regex.enumerateMatches(in: beforeBand, range: nsRange) { match, _, _ in
-                guard let match = match,
-                      let range = Range(match.range(at: 1), in: beforeBand) else { return }
-                let candidate = String(beforeBand[range])
-                    .decodeHTMLEntities()
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !candidate.isEmpty {
-                    titleText = candidate
-                }
+        let nsRange = NSRange(beforeBand.startIndex..<beforeBand.endIndex, in: beforeBand)
+        Self.h3TitleRegex.enumerateMatches(in: beforeBand, range: nsRange) { match, _, _ in
+            guard let match = match,
+                  let range = Range(match.range(at: 1), in: beforeBand) else { return }
+            let candidate = plainText(fromInnerHTML: String(beforeBand[range]))
+            if !candidate.isEmpty {
+                titleText = candidate
             }
         }
 
