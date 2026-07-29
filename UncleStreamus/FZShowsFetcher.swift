@@ -381,7 +381,27 @@ class FZShowsFetcher {
             songs.append(trimmed)
         }
 
-        return foldStandaloneQuotes(songs)
+        return foldStandaloneBracketedNotes(foldStandaloneQuotes(songs))
+    }
+
+    /// Some setlists have a stray comma between a song and its trailing "[incl. ...]"
+    /// bracket note (e.g. "Let's Move To Cleveland, [incl. Is That All There Is?, G]")
+    /// instead of attaching it directly ("Song [incl. ...]"). A *correctly* attached
+    /// bracket note never becomes its own comma-split entry — the depth tracking above
+    /// already protects commas inside "[...]" — so any entry that is itself wholly
+    /// wrapped in brackets is always the result of a stray comma. Fold it back into the
+    /// preceding entry so it renders as an annotation rather than a bogus standalone
+    /// track. Entries with no preceding song are left as-is.
+    static func foldStandaloneBracketedNotes(_ songs: [String]) -> [String] {
+        var merged: [String] = []
+        for song in songs {
+            if song.hasPrefix("["), song.hasSuffix("]"), !merged.isEmpty {
+                merged[merged.count - 1] += " \(song)"
+            } else {
+                merged.append(song)
+            }
+        }
+        return merged
     }
 
     /// Some setlists list a quote as its own comma-separated entry (e.g.
@@ -664,8 +684,11 @@ class FZShowsFetcher {
 
     /// Parses the setlist (`<p class="setlist">`) and any acronym mappings from a
     /// target section. The setlist ends at `</p>` or the next `<h5>`/`<h4>` heading,
-    /// whichever comes first (some shows have unclosed setlist tags). Returns nil
-    /// when the section has no parseable setlist.
+    /// whichever comes first (some shows have unclosed setlist tags); if neither is
+    /// present, it runs to the end of the target section, which callers have already
+    /// bounded to this show/subsection (e.g. an Early show's `<h5>` sibling boundary
+    /// removes the trailing `<h5>Late` a broken `<p>` would otherwise have fallen
+    /// back on). Returns nil only when the section has no `<p class="setlist">` at all.
     private static func parseSetlistAndAcronyms(fromSection targetSection: String)
         -> (setlist: [String], acronyms: [(short: String, full: String)])? {
 
@@ -684,9 +707,9 @@ class FZShowsFetcher {
                 }
             }
         }
-        guard let setlistEndIndex else { return nil }
+        let finalSetlistEndIndex = setlistEndIndex ?? targetSection.endIndex
 
-        let rawSetlistText = String(targetSection[setlistStart.upperBound..<setlistEndIndex])
+        let rawSetlistText = String(targetSection[setlistStart.upperBound..<finalSetlistEndIndex])
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Extract acronym mappings from raw HTML before stripping tags

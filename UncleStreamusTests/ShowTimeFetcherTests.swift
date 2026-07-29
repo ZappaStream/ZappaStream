@@ -239,6 +239,35 @@ final class ShowTimeFetcherTests: XCTestCase {
         XCTAssertEqual(result, ["q: Duke Of Earl", "Wonderful Wino"])
     }
 
+    func testParseSetlist_standaloneBracketedNoteFoldedIntoPrecedingSong() {
+        // Regression for 1982 05 22 Düsseldorf: zappateers' source has a stray comma
+        // before the "[incl. ...]" note ("Let's Move To Cleveland, [incl. Is That All
+        // There Is?, G]") instead of attaching it directly, so "Is That All There Is?"
+        // was surfacing as its own bogus track.
+        let result = FZShowsFetcher.parseSetlist(
+            "Bamboozled By Love, Let's Move To Cleveland, [incl. Is That All There Is?, G], Tinsel Town Rebellion"
+        )
+        XCTAssertEqual(result, [
+            "Bamboozled By Love",
+            "Let's Move To Cleveland [incl. Is That All There Is?, G]",
+            "Tinsel Town Rebellion",
+        ])
+    }
+
+    func testParseSetlist_correctlyAttachedBracketedNote_notDoubleFolded() {
+        // "Song [incl. ...]" with no comma before the bracket is already one entry;
+        // folding must not touch it.
+        let result = FZShowsFetcher.parseSetlist(
+            "Zoot Allures [incl. When No One Was No One, G], Sofa"
+        )
+        XCTAssertEqual(result, ["Zoot Allures [incl. When No One Was No One, G]", "Sofa"])
+    }
+
+    func testParseSetlist_standaloneBracketedNoteAtStart_keptAsOwnEntry() {
+        let result = FZShowsFetcher.parseSetlist("[incl. Foo, G], Wonderful Wino")
+        XCTAssertEqual(result, ["[incl. Foo, G]", "Wonderful Wino"])
+    }
+
     // MARK: - FZShowsFetcher.redrivedSetlist (cache migration helper)
 
     func testRedrivedSetlist_foldsStandaloneQuoteFromOldlySplitArray() {
@@ -330,6 +359,57 @@ final class ShowTimeFetcherTests: XCTestCase {
         XCTAssertNotNil(show)
         XCTAssertTrue(show?.setlist.contains("Montana") ?? false)
         XCTAssertFalse(show?.setlist.contains("King Kong") ?? true)
+    }
+
+    func testParseShowFromHTML_earlyShowUnclosedSetlistTag_stillParses() {
+        // Regression for 1976 10 24 (E) Boston Music Hall: zappateers' source HTML
+        // omits the closing </p> on the Early show's setlist, so the only terminator
+        // left is the sibling <h5>Late show</h5> — which selectTargetSection already
+        // strips out of the Early subsection. parseSetlistAndAcronyms must fall back
+        // to the end of the (already-bounded) target section instead of returning nil.
+        let html = """
+        <h4>1976 10 24 - Boston Music Hall, Boston, MA</h4>
+        <h5>Early show</h5>
+        <h6>105 min, Aud, A/A-</h6>
+        <p class="note">The better sounding recording ends after Dinah-Moe Humm.</p>
+        <p class="setlist">The Purple Lagoon, Stinkfoot, Advance Romance (q: In-A-Gadda-Da-Vida), Muffin Man.
+        <h5>Late show</h5>
+        <h6>110 min, Aud, B+</h6>
+        <p class="setlist">The Purple Lagoon, Stinkfoot, Advance Romance, Muffin Man</p>
+        <h4>1976 10 27 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "7677.html",
+            searchDate: "1976 10 24", originalDate: "1976 10 24",
+            showTime: .early, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertNotNil(show)
+        XCTAssertNotEqual(show?.setlist, ["No setlist available"])
+        XCTAssertTrue(show?.setlist.contains("Advance Romance (q: In-A-Gadda-Da-Vida)") ?? false)
+        XCTAssertTrue(show?.setlist.contains(where: { $0.hasPrefix("Muffin Man") }) ?? false)
+        // Only the Early section's songs, not the Late show's.
+        XCTAssertEqual(show?.setlist.count, 4)
+    }
+
+    func testParseShowFromHTML_dusseldorfStrayCommaBeforeBracketedNote() {
+        // Regression for 1982 05 22 Philipshalle, Düsseldorf: source HTML has
+        // "Let's Move To Cleveland, [incl. Is That All There Is?, G]" — the stray
+        // comma must not surface "Is That All There Is?" as its own track.
+        let html = """
+        <h4>1982 05 22 - Philipshalle, Düsseldorf, Germany</h4>
+        <h6>130 min, Aud, B+</h6>
+        <p class="setlist">Bamboozled By Love, Let's Move To Cleveland, [incl. Is That All There Is?, <acronym title="Guitar">G</acronym>], Tinsel Town Rebellion</p>
+        <h4>1982 05 23 - Next</h4>
+        """
+        let show = FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: "8182.html",
+            searchDate: "1982 05 22", originalDate: "1982 05 22",
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+        XCTAssertNotNil(show)
+        XCTAssertFalse(show?.setlist.contains("Is That All There Is?") ?? true)
+        XCTAssertTrue(show?.setlist.contains("Let's Move To Cleveland [incl. Is That All There Is?, G]") ?? false)
+        XCTAssertEqual(show?.setlist.count, 3)
     }
 
     func testParseShowFromHTML_acronymExtraction() {
