@@ -191,6 +191,12 @@ extension BASSRadioPlayer {
                 #if DEBUG
                 print("🔄 AAC buffer underrun detected (pos=\(String(format:"%.0f",secs)) buffered=0) — fast restart")
                 #endif
+                // AAC is the format that most needs this: its 0.3 s pre-mixer buffer drains
+                // to zero the instant the network drops (a Wi-Fi → cellular handover is the
+                // canonical case), and BASS's stall sync — which arms protection on the other
+                // formats — frequently never fires for AAC at all. Audio output has already
+                // stopped by the time we get here, so the suspension countdown is running.
+                armReconnectBackgroundProtection()
                 bassPollingQueue.async { [weak self] in self?.restartStream() }
             } else {
                 #if DEBUG
@@ -203,6 +209,12 @@ extension BASSRadioPlayer {
 
         if status == BASS_ACTIVE_STOPPED {
             guard !isReconnecting else { return }
+            // Arm here, at the first sighting of a stopped stream, rather than in each of the
+            // branches below: OGG/FLAC return early for a second confirming poll, and the FLAC
+            // recovery-stream path returns too, so all of them would otherwise spend the whole
+            // window unprotected. Live only — while DVR-paused the keepalive is already the
+            // pause's own responsibility, and while DVR-playing real audio is still rendering.
+            if dvrState == .live { armReconnectBackgroundProtection() }
             if activeFormat == "OGG" || activeFormat == "FLAC" {
                 if !oggStopConfirmed {
                     oggStopConfirmed = true
@@ -285,10 +297,7 @@ extension BASSRadioPlayer {
                 print("🔄 Stream stale: pos stuck at \(bytes)B for \(String(format:"%.1f", now - lastPositionAdvanceTime))s (dvrState=\(dvrState)) — restarting")
                 #endif
                 if dvrState == .live {
-                    #if os(iOS)
-                    beginBackgroundReconnectTaskIfNeeded()
-                    startSilenceKeepalive()
-                    #endif
+                    armReconnectBackgroundProtection()
                     DispatchQueue.main.async { [weak self] in
                         self?.isReconnecting = true
                         self?.playbackState = .buffering

@@ -400,12 +400,8 @@ extension BASSRadioPlayer {
         #if DEBUG
         print("⏸️  STALL pos=\(String(format: "%.2f", secs))s dlBuf=\(dlBuf)/\(dlEnd) rebuffering=\(rebuf)%")
         #endif
-        // Start keepalive + background task at the first stall signal — maximises the window
-        // before iOS can suspend the app. Both are no-ops if already active.
-        #if os(iOS)
-        beginBackgroundReconnectTaskIfNeeded()
-        startSilenceKeepalive()
-        #endif
+        // Arm at the first stall signal — maximises the window before iOS can suspend the app.
+        armReconnectBackgroundProtection()
         DispatchQueue.main.async { [weak self] in
             self?.playbackState = .buffering
         }
@@ -1073,15 +1069,28 @@ extension BASSRadioPlayer {
         monitor.start(queue: networkMonitorQueue)
     }
 
-    func scheduleReconnect() {
-        guard isUserIntendedPlay else { return }
+    /// Keep the app alive while audio output is absent (network loss while locked). Without
+    /// this, iOS suspends the app within seconds of the audio stopping and every recovery
+    /// mechanism freezes with it — the polling queue, the reconnect timer, and even the
+    /// NWPathMonitor callback that would notice the new network. Nothing then resumes until
+    /// the user foregrounds the app.
+    ///
+    /// Must be armed **before** a restart is attempted, not after the first failure:
+    /// `BASS_StreamCreateURL` can block for up to 10 s against a network in transition, which
+    /// is more than enough time to be suspended mid-connect.
+    ///
+    /// Idempotent, and `startSilenceKeepalive()` self-suppresses in the foreground.
+    /// No-op on macOS, which never suspends us.
+    func armReconnectBackgroundProtection() {
         #if os(iOS)
-        // Keep the app alive while audio output is absent (network loss while locked).
-        // Without this, iOS suspends the app and reconnect timers never fire.
-        // Both are no-ops if already started (e.g. handleStallSync already called them).
         beginBackgroundReconnectTaskIfNeeded()
         startSilenceKeepalive()
         #endif
+    }
+
+    func scheduleReconnect() {
+        guard isUserIntendedPlay else { return }
+        armReconnectBackgroundProtection()
         guard !BASSRadioPlayerLogic.shouldGiveUpReconnect(attempt: reconnectAttempt, maxAttempts: reconnectMaxAttempts) else {
             #if DEBUG
             print("❌ Reconnect giving up after \(reconnectMaxAttempts) attempts (~1 minute)")
