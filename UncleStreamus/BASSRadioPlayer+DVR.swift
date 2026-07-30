@@ -27,7 +27,8 @@ extension BASSRadioPlayer {
     /// Reads the live StreamBuffer's actual maxSegments so the UI denominator always
     /// reflects what the session is truly using — important when a decrease has been deferred.
     var dvrMaxBufferSeconds: Double {
-        Double(streamBuffer?.maxSegments ?? 0) * 60.0
+        guard let buffer = streamBuffer else { return 0 }
+        return Double(buffer.maxSegments) * buffer.segmentDuration
     }
 
     /// Apply a changed buffer-window setting from Settings.

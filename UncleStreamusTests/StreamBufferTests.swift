@@ -181,6 +181,130 @@ final class StreamBufferTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: unrelated.path), "sweep deleted an unrelated file")
     }
 
+    // MARK: - Segment-boundary exactness
+    //
+    // These drive the ring with a sub-second segmentDuration so hundreds of rotations (and
+    // the ring wrapping) happen in milliseconds. 0.25 s is chosen deliberately: it is exactly
+    // representable in binary *and* 0.25 × 44100 is a whole number of frames, so
+    // `bufferedDuration` and `Int(t / segmentDuration)` stay exact and the assertions below
+    // are testing the buffer, not float error.
+
+    private static let testSegDur = 0.25              // 11025 frames → 22050 samples/segment
+
+    /// Append `sampleCount` samples in bursts, mimicking the DSP callback.
+    private func append(_ sampleCount: Int, to buf: StreamBuffer, burst: Int = 7000) {
+        var remaining = sampleCount
+        let chunk = [Float](repeating: 0.25, count: burst)
+        while remaining > 0 {
+            let n = min(remaining, burst)
+            chunk.withUnsafeBytes { raw in
+                buf.append(buffer: raw.baseAddress!, length: n * MemoryLayout<Float>.size)
+            }
+            remaining -= n
+            // Let the 20 ms write tick keep up so the in-memory ring never overflows.
+            if remaining > 0 { Thread.sleep(forTimeInterval: 0.005) }
+        }
+    }
+
+    @discardableResult
+    private func waitUntil(timeout: TimeInterval = 10, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return condition()
+    }
+
+    /// The invariant the DVR playback mapping depends on: N segments of audio must produce
+    /// exactly N rotations, so `bufferedDuration == currentSegmentNumber * segmentDuration`.
+    ///
+    /// Before the boundary clamp, the chunk that crossed a boundary was written whole into the
+    /// outgoing segment (rotation only checked `>=` afterwards), so each segment ran up to one
+    /// chunk long. Playback still mapped time → segment as `t / segmentDuration`, so the two
+    /// drifted apart for the whole session — which let the DVR preloader read the surplus as
+    /// "one more segment exists" and wrap onto the oldest ring slot.
+    func testDrainAndWrite_segmentBoundariesAreExact() {
+        let segDur = Self.testSegDur
+        let buf = StreamBuffer(maxMinutes: 5, segmentDuration: segDur)
+        buf.start()
+        defer {
+            buf.stop()
+            buf.cleanup()
+        }
+
+        let segments = 20
+        append(segments * Int(buf.samplesPerSegment), to: buf)
+        XCTAssertTrue(waitUntil { buf.currentSegmentNumber >= segments },
+                      "write queue never reached \(segments) rotations (got \(buf.currentSegmentNumber))")
+
+        XCTAssertEqual(buf.currentSegmentNumber, segments,
+                       "each segment must consume exactly samplesPerSegment — no overshoot")
+        XCTAssertEqual(buf.bufferedDuration, Double(segments) * segDur, accuracy: 1e-9,
+                       "recording time drifted from the segment grid playback assumes")
+    }
+
+    /// Reading past the write head must fail rather than wrap onto the oldest ring slot.
+    /// This is the reported bug: at the end of a full buffer the preloader asked for the
+    /// segment after the last one, `segNum % maxSegments` landed on the pause segment, and
+    /// playback spliced the start of the buffer back in instead of going live.
+    func testCreatePlaybackStream_refusesReadPastWriteHead() {
+        let segDur = Self.testSegDur
+        let buf = StreamBuffer(maxMinutes: 5, segmentDuration: segDur)
+        buf.start()
+        defer {
+            buf.stop()
+            buf.cleanup()
+        }
+
+        // Protect slot 0 the way dvrPause() does, so the ring stops itself once full.
+        let full = XCTestExpectation(description: "ring reported buffer full")
+        buf.setStopBeforeSegment(index: 0) { full.fulfill() }
+
+        append(6 * Int(buf.samplesPerSegment), to: buf)
+        wait(for: [full], timeout: 10.0)
+
+        // Segments 0...4 written, then the ring stopped rather than overwrite slot 0.
+        XCTAssertEqual(buf.bufferedDuration, 5 * segDur, accuracy: 1e-9)
+
+        // The exact read preloadDVRNextSegment() makes at the end of the buffer.
+        XCTAssertFalse(buf.canPlay(from: buf.bufferedDuration),
+                       "end-of-buffer read must fail so DVR goes live")
+        XCTAssertEqual(buf.createPlaybackStream(from: buf.bufferedDuration), 0)
+
+        // A timestamp still inside the last segment stays playable. Asserted through canPlay
+        // rather than createPlaybackStream: BASS is never initialised in the test process, so
+        // BASS_StreamCreateFile returns 0 there whatever the range check decides.
+        XCTAssertTrue(buf.canPlay(from: buf.bufferedDuration - segDur / 2),
+                      "a timestamp inside the buffer must stay playable")
+    }
+
+    /// Audio the ring has already overwritten must fail too — the same modular mapping would
+    /// otherwise hand back a much newer segment as if it were the requested history.
+    func testCreatePlaybackStream_refusesOverwrittenHistory() {
+        let segDur = Self.testSegDur
+        let buf = StreamBuffer(maxMinutes: 5, segmentDuration: segDur)
+        buf.start()
+        defer {
+            buf.stop()
+            buf.cleanup()
+        }
+
+        let segments = 20   // wraps the 5-slot ring four times
+        append(segments * Int(buf.samplesPerSegment), to: buf)
+        XCTAssertTrue(waitUntil { buf.currentSegmentNumber >= segments })
+
+        XCTAssertEqual(buf.oldestAvailableTimestamp,
+                       Double(segments - buf.maxSegments + 1) * segDur, accuracy: 1e-9)
+
+        XCTAssertFalse(buf.canPlay(from: 0),
+                       "segment 0 was overwritten long ago; the read must fail, not wrap")
+        XCTAssertEqual(buf.createPlaybackStream(from: 0), 0)
+
+        XCTAssertTrue(buf.canPlay(from: buf.oldestAvailableTimestamp),
+                      "the oldest intact segment must stay playable")
+    }
+
     func testCleanup_removesSegmentFiles() throws {
         let fm = FileManager.default
         let buf = StreamBuffer(maxMinutes: 5)
