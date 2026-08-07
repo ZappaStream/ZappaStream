@@ -20,12 +20,16 @@ final class StreamBuffer {
     // MARK: - Constants
 
     private(set) var maxSegments: Int  // 1 segment per minute; set from Settings (5–30)
-    let segmentDuration = 60.0     // seconds per segment
+    let segmentDuration: Double    // seconds per segment (60 in production; short in tests)
     let sampleRate: Int32 = 44100
     let numChannels: Int32 = 2
 
     var bytesPerSecond: Int64  { Int64(sampleRate) * Int64(numChannels) * 2 }          // 176 400 B/s
-    var samplesPerSegment: Int64 { Int64(segmentDuration) * Int64(sampleRate) * Int64(numChannels) }
+    // Multiply before the Int64 conversion: a sub-second test segmentDuration would
+    // otherwise truncate to 0. Still exactly 5_292_000 at the production 60 s.
+    var samplesPerSegment: Int64 {
+        Int64(segmentDuration * Double(sampleRate)) * Int64(numChannels)
+    }
 
     private let wavHeaderSize: Int64 = 44
 
@@ -42,7 +46,12 @@ final class StreamBuffer {
 
     // MARK: - Disk state (write queue only)
 
-    private var currentSegmentIndex: Int   = 0
+    private var currentSegmentIndex: Int   = 0        // ring slot being written (0..<maxSegments)
+    /// Absolute number of the segment being written — unlike `currentSegmentIndex` this never
+    /// wraps, so it says which segment number each ring slot currently holds. Playback maps a
+    /// timestamp to `Int(t / segmentDuration)`, an absolute number too; comparing the two is
+    /// what stops a read past the end of the recording from wrapping onto a live slot.
+    private(set) var currentSegmentNumber: Int = 0
     private var samplesInCurrentSegment: Int64 = 0
     private(set) var totalSamplesWritten:  Int64 = 0  // cumulative, never reset
 
@@ -80,11 +89,16 @@ final class StreamBuffer {
 
     // MARK: - Init
 
-    /// - Parameter maxMinutes: How many minutes of audio to retain (5–30). Defaults to 15.
-    init(maxMinutes: Int = 15) {
-        maxSegments = max(5, min(30, maxMinutes))
-        tempDir     = FileManager.default.temporaryDirectory
-        memBuffer   = [Float](repeating: 0, count: 524_288)
+    /// - Parameters:
+    ///   - maxMinutes: How many minutes of audio to retain (5–30). Defaults to 15.
+    ///   - segmentDuration: Seconds per WAV segment. Production always uses the 60 s default;
+    ///     tests pass a fraction of a second so hundreds of segment rotations (and the ring
+    ///     wrapping) can be exercised in milliseconds instead of hours.
+    init(maxMinutes: Int = 15, segmentDuration: Double = 60.0) {
+        maxSegments          = max(5, min(30, maxMinutes))
+        self.segmentDuration = segmentDuration
+        tempDir              = FileManager.default.temporaryDirectory
+        memBuffer            = [Float](repeating: 0, count: 524_288)
     }
 
     // MARK: - Lifecycle
@@ -109,8 +123,21 @@ final class StreamBuffer {
 
     /// Delete all temporary WAV segment files.
     func cleanup() {
-        for i in 0..<maxSegments {
-            try? FileManager.default.removeItem(at: segmentPath(index: i))
+        Self.sweepStaleSegmentFiles()
+    }
+
+    /// Delete every DVR segment WAV in the temp directory, matched on the shared filename
+    /// prefix rather than `0..<maxSegments`. Prefix matching also catches high indices
+    /// orphaned by a lowered `dvrBufferMinutes` (30 → 5 leaves segments 5–29 behind) and
+    /// files left by a previous process that was force-quit mid-recording — up to ~300 MB
+    /// that would otherwise sit in tmp until iOS decides to purge it.
+    /// Called at launch from `BASSRadioPlayer.init()` and by `cleanup()`.
+    static func sweepStaleSegmentFiles() {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        guard let names = try? fm.contentsOfDirectory(atPath: tmp.path) else { return }
+        for name in names where name.hasPrefix(segmentFilePrefix) && name.hasSuffix(".wav") {
+            try? fm.removeItem(at: tmp.appendingPathComponent(name))
         }
     }
 
@@ -154,13 +181,37 @@ final class StreamBuffer {
     /// Alias for `bufferedDuration`; represents the recording timestamp at the write head.
     var currentTimestamp: Double { bufferedDuration }
 
+    /// Recording time of the oldest audio still on disk. Everything before this has been
+    /// overwritten by the ring, so a read here would silently return much newer audio.
+    var oldestAvailableTimestamp: Double {
+        Double(max(0, currentSegmentNumber - maxSegments + 1)) * segmentDuration
+    }
+
     // MARK: - Playback Stream Creation
+
+    /// Whether `timestamp` falls inside the audio currently on disk.
+    ///
+    /// The upper bound matters because `segNum % maxSegments` wraps: a read past the write head
+    /// would otherwise return the *oldest* segment instead of failing. That is the end-of-buffer
+    /// bug — the DVR preloader asked for the segment after the last one and got the start of the
+    /// buffer, so playback spliced it in and replayed rather than going live. Overwritten history
+    /// (below `oldestAvailableTimestamp`) wraps the same way, handing back much newer audio.
+    ///
+    /// Split out from `createPlaybackStream` so it can be unit-tested: the test process never
+    /// calls `BASS_Init`, so `BASS_StreamCreateFile` cannot succeed there and the stream-creating
+    /// path can only be asserted on in its failing direction.
+    func canPlay(from timestamp: Double) -> Bool {
+        guard timestamp >= 0,
+              timestamp < bufferedDuration,
+              timestamp >= oldestAvailableTimestamp else { return false }
+        return Int(timestamp / segmentDuration) <= currentSegmentNumber
+    }
 
     /// Create a BASS file stream starting at `timestamp` seconds into the recording.
     /// The caller must call `BASS_StreamFree` when done.
     /// Returns 0 if the segment file does not exist or the timestamp is out of range.
     func createPlaybackStream(from timestamp: Double) -> DWORD {
-        guard timestamp >= 0, timestamp < bufferedDuration else { return 0 }
+        guard canPlay(from: timestamp) else { return 0 }
 
         let segNum     = Int(timestamp / segmentDuration)
         let segIdx     = segNum % maxSegments
@@ -191,8 +242,11 @@ final class StreamBuffer {
 
     // MARK: - Private — Segment Management
 
+    /// Shared filename prefix for every on-disk segment; the sweep matches on it.
+    static let segmentFilePrefix = "zappastream_dvr_seg_"
+
     private func segmentPath(index: Int) -> URL {
-        tempDir.appendingPathComponent("zappastream_dvr_seg_\(index).wav")
+        tempDir.appendingPathComponent("\(Self.segmentFilePrefix)\(index).wav")
     }
 
     private func openSegment(index: Int) {
@@ -229,7 +283,18 @@ final class StreamBuffer {
             os_unfair_lock_unlock(&lock)
             guard available >= 2 else { break }
 
-            let chunkSamples = min(available & ~1, maxChunkSamples)   // even, ≤ maxChunkSamples
+            // Never write past the segment boundary. Without this clamp the chunk that crosses
+            // the boundary lands entirely in the outgoing file, so every segment runs up to one
+            // chunk (~93 ms) long while playback still maps time → segment as `t / segmentDuration`.
+            // That error accumulated over the whole session — hours of streaming drifted
+            // `bufferedDuration` seconds past `segmentsWritten * segmentDuration`, and the DVR
+            // preloader read the surplus as "one more segment exists", wrapping onto the oldest
+            // slot and replaying the buffer instead of going live.
+            // `samplesPerSegment` and `samplesInCurrentSegment` are both even, so the clamp keeps
+            // chunks stereo-aligned; it is ≥ 2 here because rotation fires the moment the boundary
+            // is reached.
+            let remainingInSegment = Int(samplesPerSegment - samplesInCurrentSegment)
+            let chunkSamples = min(available & ~1, maxChunkSamples, remainingInSegment)
             var chunk = [Float](repeating: 0, count: chunkSamples)
 
             os_unfair_lock_lock(&lock)
@@ -252,24 +317,22 @@ final class StreamBuffer {
             samplesInCurrentSegment += Int64(chunkSamples)
             totalSamplesWritten     += Int64(chunkSamples)
 
-            // Rotate to next segment when the current one is full.
+            // Rotate to next segment when the current one is full. The chunk clamp above means
+            // this is always an exact hit, so `totalSamplesWritten` lands on a clean segment
+            // boundary and `bufferedDuration == segmentsWritten * segmentDuration`.
             if samplesInCurrentSegment >= samplesPerSegment {
                 closeCurrentSegment()
                 let nextIdx = (currentSegmentIndex + 1) % maxSegments
                 // If the next slot is protected (pause segment), stop cleanly without
                 // overwriting it — the full ring content from dvrPauseTimestamp is intact.
                 if let stopBefore = stopBeforeSegmentIndex, nextIdx == stopBefore {
-                    // Remove the chunk-size overshoot so bufferedDuration lands on a clean
-                    // segment boundary. Without this, bufferedDuration > maxSecs by up to
-                    // ~93 ms, which lets preloadDVRNextSegment open the protected pause
-                    // segment as "segment N+1" and play wrong audio before going live.
-                    totalSamplesWritten -= Int64(samplesInCurrentSegment - samplesPerSegment)
                     isRunning = false
                     let cb = onBufferFull
                     DispatchQueue.main.async { cb?() }
                     return
                 }
-                currentSegmentIndex = nextIdx
+                currentSegmentIndex   = nextIdx
+                currentSegmentNumber += 1
                 openSegment(index: currentSegmentIndex)
             }
         }

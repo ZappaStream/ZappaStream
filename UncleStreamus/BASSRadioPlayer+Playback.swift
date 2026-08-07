@@ -400,12 +400,8 @@ extension BASSRadioPlayer {
         #if DEBUG
         print("⏸️  STALL pos=\(String(format: "%.2f", secs))s dlBuf=\(dlBuf)/\(dlEnd) rebuffering=\(rebuf)%")
         #endif
-        // Start keepalive + background task at the first stall signal — maximises the window
-        // before iOS can suspend the app. Both are no-ops if already active.
-        #if os(iOS)
-        beginBackgroundReconnectTaskIfNeeded()
-        startSilenceKeepalive()
-        #endif
+        // Arm at the first stall signal — maximises the window before iOS can suspend the app.
+        armReconnectBackgroundProtection()
         DispatchQueue.main.async { [weak self] in
             self?.playbackState = .buffering
         }
@@ -919,7 +915,6 @@ extension BASSRadioPlayer {
     /// even at volume 0.0 — this prevents suspension for tunnels longer than ~30s.
     /// Safe to call repeatedly; no-ops if already running.
     func startSilenceKeepalive() {
-        guard silenceKeepalivePlayer == nil else { return }
         #if os(iOS)
         // The keepalive only prevents *background* suspension. In the foreground iOS never suspends
         // us, and an active silent player makes iOS believe audio is rendering — which (because we
@@ -927,6 +922,15 @@ extension BASSRadioPlayer {
         // AirPods/lock-screen button to pauseCommand even while DVR-paused, silently breaking resume.
         guard !isAppInForeground else { return }
         #endif
+        // A player that exists but has stopped is worse than no player at all. An interruption
+        // (call, Siri, another app claiming the session) stops the AVAudioPlayer without nil-ing
+        // it, so the old `== nil` guard blocked every restart for the rest of the session — iOS
+        // then suspended us and the recording pump froze mid-pause. Rebuild a stopped player.
+        if let existing = silenceKeepalivePlayer {
+            guard !existing.isPlaying else { return }
+            existing.stop()
+            silenceKeepalivePlayer = nil
+        }
         guard let data = Self.silentWAVData,
               let player = try? AVAudioPlayer(data: data, fileTypeHint: AVFileType.wav.rawValue)
         else {
@@ -938,15 +942,59 @@ extension BASSRadioPlayer {
         player.numberOfLoops = -1
         player.volume = 0.0
         player.prepareToPlay()
-        player.play()
+        // play() returns false when the session isn't usable yet — typically right after an
+        // interruption ends, before the session has been reactivated. Best-effort reactivate
+        // and retry rather than silently leaving the app unprotected against suspension.
+        guard player.play() else {
+            #if DEBUG
+            print("⚠️ Silence keepalive: play() refused — reactivating session and retrying")
+            #endif
+            player.stop()
+            try? AVAudioSession.sharedInstance().setActive(true)
+            scheduleSilenceKeepaliveRetry()
+            return
+        }
         silenceKeepalivePlayer = player
+        silenceKeepaliveRetryCount = 0
         #if DEBUG
         print("🔇 Silence keepalive started — audio session stays alive during reconnect")
+        logDVRDiag("keepalive-start")
+        #endif
+    }
+
+    /// Retry a refused keepalive start up to 3 times, 1 s apart. Abandoned as soon as the
+    /// conditions that need it are gone (playback resumed, or we came back to the foreground).
+    private func scheduleSilenceKeepaliveRetry() {
+        guard silenceKeepaliveRetryCount < 3 else {
+            #if DEBUG
+            print("⚠️ Silence keepalive: giving up after \(silenceKeepaliveRetryCount) retries")
+            #endif
+            return
+        }
+        silenceKeepaliveRetryCount += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.dvrState == .paused, !self.isAppInForeground else { return }
+            self.startSilenceKeepalive()
+        }
+    }
+
+    /// Re-arm the keepalive after something outside our control may have killed it: an
+    /// interruption, a route change, or an AVAudioPlayer death we get no notification for.
+    /// Resets the retry budget — this is a new episode, not a continuation of the last burst.
+    /// No-op unless we're actually backgrounded, DVR-paused, and not already keeping alive.
+    func rearmSilenceKeepaliveIfNeeded() {
+        guard !isAppInForeground, dvrState == .paused else { return }
+        guard silenceKeepalivePlayer?.isPlaying != true else { return }
+        silenceKeepaliveRetryCount = 0
+        startSilenceKeepalive()
+        #if DEBUG
+        logDVRDiag("keepalive-rearm")
         #endif
     }
 
     /// Stop the silence keepalive. Called when real audio resumes or playback is explicitly stopped.
     func stopSilenceKeepalive() {
+        silenceKeepaliveRetryCount = 0   // cancels any in-flight retry burst
         guard let player = silenceKeepalivePlayer else { return }
         player.stop()
         silenceKeepalivePlayer = nil
@@ -1021,19 +1069,37 @@ extension BASSRadioPlayer {
         monitor.start(queue: networkMonitorQueue)
     }
 
-    func scheduleReconnect() {
-        guard isUserIntendedPlay else { return }
+    /// Keep the app alive while audio output is absent (network loss while locked). Without
+    /// this, iOS suspends the app within seconds of the audio stopping and every recovery
+    /// mechanism freezes with it — the polling queue, the reconnect timer, and even the
+    /// NWPathMonitor callback that would notice the new network. Nothing then resumes until
+    /// the user foregrounds the app.
+    ///
+    /// Must be armed **before** a restart is attempted, not after the first failure:
+    /// `BASS_StreamCreateURL` can block for up to 10 s against a network in transition, which
+    /// is more than enough time to be suspended mid-connect.
+    ///
+    /// Idempotent, and `startSilenceKeepalive()` self-suppresses in the foreground.
+    /// No-op on macOS, which never suspends us.
+    func armReconnectBackgroundProtection() {
         #if os(iOS)
-        // Keep the app alive while audio output is absent (network loss while locked).
-        // Without this, iOS suspends the app and reconnect timers never fire.
-        // Both are no-ops if already started (e.g. handleStallSync already called them).
         beginBackgroundReconnectTaskIfNeeded()
         startSilenceKeepalive()
         #endif
+    }
+
+    func scheduleReconnect() {
+        guard isUserIntendedPlay else { return }
+        armReconnectBackgroundProtection()
         guard !BASSRadioPlayerLogic.shouldGiveUpReconnect(attempt: reconnectAttempt, maxAttempts: reconnectMaxAttempts) else {
             #if DEBUG
             print("❌ Reconnect giving up after \(reconnectMaxAttempts) attempts (~1 minute)")
             #endif
+            // Drop the intent with the state. Leaving it true made the UI say "stopped" while
+            // every auto-restart gate that reads isUserIntendedPlay (route change, foreground,
+            // interruption ended, network monitor) still passed — so a later AirPods event could
+            // start audio out of what the user saw as a stopped app.
+            isUserIntendedPlay = false
             DispatchQueue.main.async {
                 self.isReconnecting = false
                 self.playbackState = .stopped

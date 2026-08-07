@@ -343,5 +343,75 @@ final class BASSRadioPlayerLogicTests: XCTestCase {
         // 1 s lead < 2 → would cause rapid cycling / false go-live.
         XCTAssertFalse(BASSRadioPlayerLogic.shouldPreloadNextSegment(bufferedDuration: 181, nextSegmentTimestamp: 180))
     }
+
+    // MARK: - dvrResumeAction(...)
+
+    func testResumeAction_frozenPump_isStale() {
+        // The reported failure: away 2 hours, keepalive died after ~8 s of recording.
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 7200, recordedSecondsSincePause: 8, bufferIsFull: false),
+            .goLiveStale)
+    }
+
+    func testResumeAction_healthyBackgroundPause_resumes() {
+        // Keepalive held: recorded tracks wall clock ~1 s/s.
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 1800, recordedSecondsSincePause: 1795, bufferIsFull: false),
+            .resumeFromBuffer)
+    }
+
+    func testResumeAction_flakyOvernight_resumes() {
+        // Hours of valid audio with network losses: the gap is huge but the ratio holds.
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 28800, recordedSecondsSincePause: 20000, bufferIsFull: false),
+            .resumeFromBuffer)
+    }
+
+    func testResumeAction_shortPauseFreeze_resumes() {
+        // Recorded nothing, but only 90 s elapsed — under the absolute gap, so not stale.
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 90, recordedSecondsSincePause: 0, bufferIsFull: false),
+            .resumeFromBuffer)
+    }
+
+    func testResumeAction_gapBoundary_isExclusive() {
+        // gap == 120 does not trip; just past it does (ratio fails in both cases).
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 130, recordedSecondsSincePause: 10, bufferIsFull: false),
+            .resumeFromBuffer)
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 130.1, recordedSecondsSincePause: 10, bufferIsFull: false),
+            .goLiveStale)
+    }
+
+    func testResumeAction_ratioBoundary_isExclusive() {
+        // Exactly half of wall recorded counts as healthy despite a 300 s gap.
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 600, recordedSecondsSincePause: 300, bufferIsFull: false),
+            .resumeFromBuffer)
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 600, recordedSecondsSincePause: 299, bufferIsFull: false),
+            .goLiveStale)
+    }
+
+    func testResumeAction_fullBufferOverridesStaleness() {
+        // Recording stopped on purpose when the ring filled — the buffer is complete.
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 7200, recordedSecondsSincePause: 8, bufferIsFull: true),
+            .resumeFromBuffer)
+    }
+
+    func testResumeAction_negativeInputsClampToHealthy() {
+        // A backwards clock change or unset pause time must not fake a stale buffer.
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: -5000, recordedSecondsSincePause: -10, bufferIsFull: false),
+            .resumeFromBuffer)
+    }
+
+    func testResumeAction_zeroWall_resumes() {
+        XCTAssertEqual(BASSRadioPlayerLogic.dvrResumeAction(
+            wallSecondsSincePause: 0, recordedSecondsSincePause: 0, bufferIsFull: false),
+            .resumeFromBuffer)
+    }
 }
 #endif

@@ -140,6 +140,10 @@ enum BASSConfig {
     /// iOS will not suspend an app with an active .playback session producing audio output,
     /// even at volume 0.0 — so this prevents suspension during tunnels > ~30s.
     var silenceKeepalivePlayer: AVAudioPlayer?
+    /// Attempts used by the current keepalive-start episode. `play()` can fail while the
+    /// session is still locked by an interruption that just ended; a short retry burst
+    /// covers that. Reset on success, on stop, and by `rearmSilenceKeepaliveIfNeeded()`.
+    var silenceKeepaliveRetryCount: Int = 0
     #endif
 
     /// Incremented by freeStream() each time handles are torn down. Captured by restartStream()
@@ -155,7 +159,9 @@ enum BASSConfig {
     var lastPositionAdvanceTime: TimeInterval = 0
 
     /// True only while the user intends playback to be active.
-    /// Set true in switchQuality(); false only in stop() / stopWithFadeOut().
+    /// Set true in switchQuality(); false in stop() / stopWithFadeOut(), and when
+    /// scheduleReconnect() exhausts its attempts (the state goes .stopped there, so the
+    /// intent must go with it or the auto-restart gates keep firing on a "stopped" app).
     /// freeStream() and restartStream() must NOT touch this.
     var isUserIntendedPlay: Bool = false
 
@@ -181,14 +187,24 @@ enum BASSConfig {
     // Pumps the decode-only pre-mixer while the output mixer is paused during DVR pause.
     // Keeps the recording DSP firing so WAV segments continue to be written to disk.
     var dvrRecordingPumpSource: DispatchSourceTimer?
-    var dvrRecordingPumpBuf = [UInt8](repeating: 0, count: 35280) // 100ms at 44.1kHz stereo float32
+    // 200 ms at 44.1 kHz stereo float32 — twice the 100 ms tick interval. The headroom lets a
+    // jittered or delayed tick pull the backlog and catch up; a buffer sized exactly to the
+    // tick could only ever fall further behind the wall clock.
+    var dvrRecordingPumpBuf = [UInt8](repeating: 0, count: 70560)
+    /// Consecutive pump ticks that found the pre-mixer STOPPED (dead live source).
+    var dvrPumpDeadTickCount: Int = 0
+    /// `systemUptime` of the last pump-driven recovery attempt; throttles the restarts.
+    var dvrPumpLastRecoveryAttempt: TimeInterval = 0
+
+    /// Pump ticks since the pump last started (~10/s). Drives the periodic keepalive health
+    /// check on iOS, so it is not DEBUG-only. Reset each time the pump starts.
+    var dvrPumpTickCount: Int = 0
 
     #if DEBUG
     // Diagnostics for the DVR background-recording investigation (see plan
     // cosmic-doodling-sifakis). Track recording-pump liveness so we can detect when iOS
     // suspended the app (pump gap) vs the stream stalling. Reset each time the pump starts.
     var dvrPumpLastTick: Date = .distantPast
-    var dvrPumpTickCount: Int = 0
     #endif
 
     // 3s retry interval, giving up after 12 attempts (~1 minute total).
@@ -374,6 +390,10 @@ enum BASSConfig {
     var dvrPausedStreams:   [DWORD]        = []  // streams kept alive during dvrPausePlayback() fade-out
     var dvrPauseTimestamp:  Double         = 0
     var dvrPauseWallTime:   Date           = .distantPast  // wall clock when DVR was (re-)paused
+    /// `streamBuffer.bufferedDuration` at the moment of the pause. Subtracting it from the
+    /// current value gives how much was actually recorded while paused, which compared against
+    /// elapsed wall time is what detects a frozen recording pump (see `dvrResume()`).
+    var dvrPauseBufferedAtPause: Double    = 0
     var dvrPauseOffset:     Double         = 0             // behindLiveSeconds at the moment of pause
     var dvrCurrentSegNum:   Int            = 0
     var dvrNextSegNum:      Int            = 0
@@ -476,6 +496,13 @@ enum BASSConfig {
         // output unit against the default .soloAmbient session, producing garbled or misrouted
         // audio on AirPods when a new build is installed over a running one.
         startNetworkMonitoring()
+        // Delete buffer segment WAVs orphaned by a previous run (a force-quit or crash while
+        // recording leaves the whole ring on disk — up to ~300 MB). The player is created once
+        // at app scope before any StreamBuffer exists, so there is nothing live to race with.
+        // Skipped under XCTest so StreamBufferTests' own segment files stay deterministic.
+        if ProcessInfo.processInfo.environment["XCTestBundlePath"] == nil {
+            DispatchQueue.global(qos: .utility).async { StreamBuffer.sweepStaleSegmentFiles() }
+        }
     }
 
     /// Initialize BASS against the current AVAudioSession. Called once from switchQuality()

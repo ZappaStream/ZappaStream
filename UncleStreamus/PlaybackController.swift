@@ -63,6 +63,22 @@ final class PlaybackController {
     // are never removed — the controller lives for the whole process.
     private var systemObservers: [NSObjectProtocol] = []
 
+    // When the audio route last changed. AirPods in-ear detection and accessory
+    // connect/disconnect make iOS synthesize a remote transport command aimed at the
+    // current Now Playing app — which we deliberately remain while buffer-paused, so that
+    // an AirPods/lock-screen press can resume. Timestamping route changes is what lets the
+    // remote handlers tell those synthesized commands from a real press.
+    private var lastRouteChangeAt: Date = .distantPast
+
+    /// True when a remote play/pause/toggle arrived close enough to an audio route change
+    /// that it is almost certainly iOS's own synthesized command (AirPods ear detection,
+    /// accessory connect or disconnect) rather than a user press — a deliberate press is
+    /// never coincident with one. Only ever used to suppress commands that would *start*
+    /// audio; a command that stops audio is always honoured, whatever its origin.
+    private var isLikelyRouteSynthesizedCommand: Bool {
+        Date().timeIntervalSince(lastRouteChangeAt) < 2.0
+    }
+
     // Read AppStorage-backed preferences straight from UserDefaults so this
     // app-scope object doesn't need the view's @AppStorage wrappers.
     private var dvrEnabled: Bool {
@@ -212,16 +228,32 @@ final class PlaybackController {
                 #if DEBUG
                 print("▶️  remoteCmd PLAY — isPlaying=\(isPlaying) dvrState=\(bassPlayer.dvrState) streamActive=\(bassPlayer.isStreamActive)")
                 #endif
+                if bassPlayer.dvrState == .playing {
+                    // iOS sent play while DVR is already in playback state — mixer may have
+                    // stopped silently after an audio route change. Re-route and kick it.
+                    // Deliberately NOT route-guarded: this only revives audio that is meant to
+                    // be playing, and a route change is exactly when it's needed.
+                    guard bassPlayer.checkUserActionAllowed() else { return }
+                    configureAudioSession()
+                    bassPlayer.ensureOutputPlaying()
+                    updateNowPlayingInfo()
+                    return
+                }
+                // Everything below starts audio that is currently silent. Putting AirPods in
+                // makes iOS synthesize a play command aimed at us; the user paused/stopped on
+                // purpose and expects that to stick. Checked BEFORE checkUserActionAllowed()
+                // so a suppressed command doesn't consume the 1.2 s debounce and swallow the
+                // real press that may follow it.
+                guard !isLikelyRouteSynthesizedCommand else {
+                    #if DEBUG
+                    print("🚫 remoteCmd PLAY suppressed — arrived within 2s of a route change")
+                    #endif
+                    return
+                }
                 guard bassPlayer.checkUserActionAllowed() else { return }
                 if bassPlayer.dvrState == .paused {
                     configureAudioSession()
                     bassPlayer.dvrResume()
-                    updateNowPlayingInfo()
-                } else if bassPlayer.dvrState == .playing {
-                    // iOS sent play while DVR is already in playback state — mixer may have
-                    // stopped silently after an audio route change. Re-route and kick it.
-                    configureAudioSession()
-                    bassPlayer.ensureOutputPlaying()
                     updateNowPlayingInfo()
                 } else if !isPlaying || !bassPlayer.isStreamActive {
                     // Start or restart: covers initial play AND the case where isPlaying is
@@ -245,6 +277,16 @@ final class PlaybackController {
                 // 1.2s debounce blocks an iOS double-fired pause right after the real pause from
                 // accidentally resuming.
                 if bassPlayer.dvrState == .paused {
+                    // ...but only for a command the *user* sent. Taking AirPods out also makes
+                    // iOS send a pause, and reading it as "resume" is how removing AirPods used
+                    // to start playback out of a paused buffer. A route-coincident pause is
+                    // never a resume intent.
+                    guard !isLikelyRouteSynthesizedCommand else {
+                        #if DEBUG
+                        print("🚫 remoteCmd PAUSE→resume suppressed — arrived within 2s of a route change")
+                        #endif
+                        return
+                    }
                     guard bassPlayer.checkUserActionAllowed() else { return }
                     configureAudioSession()
                     bassPlayer.dvrResume()
@@ -272,6 +314,19 @@ final class PlaybackController {
                 #if DEBUG
                 print("⏯️  remoteCmd TOGGLE — isPlaying=\(isPlaying) dvrState=\(bassPlayer.dvrState) streamActive=\(bassPlayer.isStreamActive)")
                 #endif
+                // A toggle that would START audio gets the same route-origin guard as the play
+                // command; one that would PAUSE is always honoured. iOS delivers a toggle for
+                // some accessory connect/disconnect events, and from a silent state that would
+                // otherwise begin playback the user never asked for.
+                let toggleWouldStartAudio = !isPlaying
+                    || bassPlayer.dvrState == .paused
+                    || !bassPlayer.isStreamActive
+                if toggleWouldStartAudio, isLikelyRouteSynthesizedCommand {
+                    #if DEBUG
+                    print("🚫 remoteCmd TOGGLE suppressed — would start audio within 2s of a route change")
+                    #endif
+                    return
+                }
                 guard bassPlayer.checkUserActionAllowed() else { return }
                 switch (isPlaying, bassPlayer.dvrState) {
                 case (false, _):
@@ -603,6 +658,17 @@ final class PlaybackController {
             MainActor.assumeIsolated { self?.handleAudioInterruption(notification) }
         })
 
+        // Stamp every route change, whatever the reason. Registered FIRST on purpose:
+        // NotificationCenter delivers in registration order, so the timestamp is already set
+        // when the two handlers below (and any remote command that follows) read it. Ear
+        // detection frequently reports .routeConfigurationChange rather than a device
+        // appearing/disappearing, so no reason is filtered out here.
+        systemObservers.append(center.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: session, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.lastRouteChangeAt = Date() }
+        })
+
         // Pause to DVR when headphones are removed (AirPod taken out, Bluetooth disconnect,
         // wired unplug). Without this, audio routes to the iPhone speaker and the DVR ring
         // buffer never gets created.
@@ -649,9 +715,24 @@ final class PlaybackController {
             print("🔔 AVAudioSession interruption ENDED — shouldResume=\(opts.contains(.shouldResume)) dvrState=\(bassPlayer.dvrState) userIntendedPlay=\(bassPlayer.isUserIntendedPlay)")
             bassPlayer.logDVRDiag("interrupt-ended")
             #endif
+            // Deliberately only acted on with .shouldResume: without it the user chose other
+            // audio, and reactivating our non-mixable session would interrupt them. A pause
+            // left unprotected that way degrades gracefully — the stale-resume gate in
+            // dvrResume() sends the next play press straight to live instead of into a sliver.
             if opts.contains(.shouldResume) && bassPlayer.isUserIntendedPlay {
                 configureAudioSession()
-                bassPlayer.triggerImmediateReconnect()
+                // Re-arm the keepalive: the interruption stopped the silent player, and while
+                // we stay DVR-paused in the background nothing else would restart it — that is
+                // exactly how iOS ends up suspending us and freezing the recording pump.
+                bassPlayer.rearmSilenceKeepaliveIfNeeded()
+                // Skip the reconnect once the buffer is full: recording is intentionally over
+                // and the live channel is paused on purpose (the play-buffer-vs-go-live choice
+                // is offered on the next play press). Otherwise reconnect — while paused it
+                // routes to the buffer-preserving partialRestartLiveChannel(), which is what
+                // restores recording after a call.
+                if !(bassPlayer.dvrState == .paused && bassPlayer.dvrBufferFull) {
+                    bassPlayer.triggerImmediateReconnect()
+                }
             }
         }
     }
@@ -678,7 +759,9 @@ final class PlaybackController {
         case .playing:
             bassPlayer.dvrPausePlayback()
         case .paused:
-            break   // already paused
+            // Already paused — but a route change can stop the silent keepalive, and while
+            // backgrounded that leads to suspension and a frozen recording pump. Re-check it.
+            bassPlayer.rearmSilenceKeepaliveIfNeeded()
         }
     }
 
@@ -703,6 +786,9 @@ final class PlaybackController {
         try? session.setCategory(.playback, mode: .default, options: [.allowBluetoothA2DP, .allowAirPlay])
         try? session.setActive(true)
         bassPlayer.restartOutputAfterRouteChange()
+        // Same reasoning as the removal case: the route transition can have stopped the
+        // keepalive while we were background-paused. No-op unless it's actually needed.
+        bassPlayer.rearmSilenceKeepaliveIfNeeded()
     }
 
     // MARK: - Playback verbs

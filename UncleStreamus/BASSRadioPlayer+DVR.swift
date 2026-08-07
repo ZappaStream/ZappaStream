@@ -27,7 +27,8 @@ extension BASSRadioPlayer {
     /// Reads the live StreamBuffer's actual maxSegments so the UI denominator always
     /// reflects what the session is truly using — important when a decrease has been deferred.
     var dvrMaxBufferSeconds: Double {
-        Double(streamBuffer?.maxSegments ?? 0) * 60.0
+        guard let buffer = streamBuffer else { return 0 }
+        return Double(buffer.maxSegments) * buffer.segmentDuration
     }
 
     /// Apply a changed buffer-window setting from Settings.
@@ -73,6 +74,7 @@ extension BASSRadioPlayer {
         guard mixerHandle != 0, preMixerHandle != 0 else { return }
 
         dvrPauseTimestamp = streamBuffer?.currentTimestamp ?? 0
+        dvrPauseBufferedAtPause = streamBuffer?.bufferedDuration ?? 0
         dvrState = .paused
         startBehindTimer()   // begin counting up how far behind live the user is
 
@@ -137,6 +139,7 @@ extension BASSRadioPlayer {
         dvrMetadataTimer = nil
 
         dvrPauseTimestamp = currentRecordingTime
+        dvrPauseBufferedAtPause = buffer.bufferedDuration
         dvrState = .paused   // prevents handleDVRStreamEndMixtime from advancing the segment
         startBehindTimer()
 
@@ -180,21 +183,50 @@ extension BASSRadioPlayer {
             #endif
             return
         }
-        // Mark the full-buffer episode as draining so a later mid-drain pause/resume
-        // (which also lands in dvrState == .paused) won't re-prompt the play-vs-live choice.
-        if dvrBufferFull { dvrFullBufferDrainStarted = true }
-        stopDVRRecordingPump()
-        #if os(iOS)
-        stopSilenceKeepalive()   // real DVR audio takes over as the keepalive
-        #endif
+        // Staleness gate. If recording froze while we were backgrounded (the keepalive died
+        // and iOS suspended us), the buffer holds only a few seconds against hours of wall
+        // clock. Playing that sliver gives ~5-10 s of audio, an end-of-buffer retry storm and
+        // an eventual fall-through to live — so skip straight to live instead. Placed inside
+        // dvrResume() so every entry point (remote commands, resumeOrOfferBuffer, both
+        // ContentViews) is covered.
+        let wallSincePause = dvrPauseWallTime == .distantPast
+            ? 0 : Date().timeIntervalSince(dvrPauseWallTime)
+        let recordedSincePause = max(0, buffer.bufferedDuration - dvrPauseBufferedAtPause)
+        if BASSRadioPlayerLogic.dvrResumeAction(wallSecondsSincePause: wallSincePause,
+                                                recordedSecondsSincePause: recordedSincePause,
+                                                bufferIsFull: dvrBufferFull) == .goLiveStale {
+            #if DEBUG
+            print("⏱️ DVR resume: buffer is stale (wall=\(Int(wallSincePause))s recorded=\(Int(recordedSincePause))s) — going live")
+            logDVRDiag("resume-stale")
+            #endif
+            // Full restart: after hours suspended the live BASS stream is dead, so the
+            // fade-in path would produce silence rather than audio.
+            goLive(forceFullRestart: true)
+            return
+        }
 
         let stream = buffer.createPlaybackStream(from: dvrPauseTimestamp)
         guard stream != 0 else {
             #if DEBUG
             print("❌ DVR: failed to create playback stream at t=\(dvrPauseTimestamp)")
+            logDVRDiag("resume-failed")
             #endif
+            // The buffer is unplayable. Returning here would leave the player latched in
+            // .paused with no audio and no way out but another play press, so go live —
+            // strictly better than a dead state.
+            goLive()
             return
         }
+
+        // Only now that a playable stream exists: mark the full-buffer episode as draining
+        // (so a later mid-drain pause/resume won't re-prompt the play-vs-live choice) and
+        // hand recording duty back over. Both must happen before the mixer is unpaused
+        // below, so the pump and the mixer never pull from the pre-mixer at the same time.
+        if dvrBufferFull { dvrFullBufferDrainStarted = true }
+        stopDVRRecordingPump()
+        #if os(iOS)
+        stopSilenceKeepalive()   // real DVR audio takes over as the keepalive
+        #endif
 
         dvrPlaybackStream = stream
         dvrCurrentSegNum  = BASSRadioPlayerLogic.dvrSegmentIndex(pauseTimestamp: dvrPauseTimestamp,
@@ -267,7 +299,11 @@ extension BASSRadioPlayer {
 
     /// Exit DVR mode and return to the live stream immediately.
     /// The live stream is unmuted with a fade-in.
-    func goLive() {
+    ///
+    /// - Parameter forceFullRestart: Discard the buffer and rebuild the live stream from
+    ///   scratch instead of fading the existing one back in. Used by the stale-resume path,
+    ///   where the live stream has been dead for hours and a fade-in would yield silence.
+    func goLive(forceFullRestart: Bool = false) {
         guard dvrState != .live else { return }
         stopDVRRecordingPump()
         #if os(iOS)
@@ -311,18 +347,26 @@ extension BASSRadioPlayer {
         let wasBufferFull = dvrBufferFull
         dvrReturnOfferPending = false
         dvrFullBufferDrainStarted = false
-        if dvrBufferFull {
+        if dvrBufferFull || forceFullRestart {
             dvrBufferFull = false
+            streamBuffer?.stop()          // no-op if the ring already stopped itself
             streamBuffer?.cleanup()       // delete the preserved WAV segment files
             let dvrMins = UserDefaults.standard.integer(forKey: "dvrBufferMinutes")
             streamBuffer = StreamBuffer(maxMinutes: dvrMins > 0 ? dvrMins : 15)
             streamBuffer?.start()
+        } else {
+            // Lift the stop-before protection armed at pause time. Only dvrResume() used to
+            // clear it, so pause → Go Live left the ring armed to stop cleanly the next time
+            // it wrapped to that segment — recording would silently freeze later in the
+            // session, long after the pause that caused it.
+            streamBuffer?.clearStopBeforeSegment()
         }
 
         // FLAC always restarts from scratch. Non-FLAC also restarts when the live stream was
-        // paused (buffer-full): the paused channel has no usable download buffer, so a fresh
-        // connect is identical to a normal play-from-stopped experience.
-        if activeFormat == "FLAC" || wasBufferFull {
+        // paused (buffer-full) or when the caller forced it (stale resume): the paused or
+        // long-suspended channel has no usable download buffer, so a fresh connect is
+        // identical to a normal play-from-stopped experience.
+        if activeFormat == "FLAC" || wasBufferFull || forceFullRestart {
             bassPollingQueue.async { [weak self] in self?.restartStream() }
             #if DEBUG
             print("📡 DVR → LIVE (full restart)")
@@ -363,7 +407,14 @@ extension BASSRadioPlayer {
             pauseTimestamp: dvrPauseTimestamp)
         dvrBufferFull = true
         streamBuffer?.stop()          // idempotent: StreamBuffer already stopped itself via stopBeforeSegmentIndex
-        // Stop metadata + state polling (includes FLAC health check) — no longer needed.
+        // Nothing is being recorded any more, so the pump has no purpose — it would just keep
+        // draining the pre-mixer (and, with the dead-source detection above, eventually
+        // "recover" a channel we deliberately pause below). The keepalive stays running: it is
+        // what keeps the lock-screen play affordance alive so the user can accept the offer.
+        stopDVRRecordingPump()
+        // Stop metadata + state polling (includes FLAC health check) — no longer needed, and
+        // with the download channel intentionally paused below the staleness watchdog could
+        // only ever false-positive and trigger pointless restarts.
         stopMetadataPolling()
         // Pause the live download channel for all formats to stop network activity.
         // goLive() will do a full stream restart (restartStream()) when wasBufferFull is true.
@@ -623,6 +674,17 @@ extension BASSRadioPlayer {
     func partialRestartLiveChannel() {
         guard activeFormat != "FLAC" else {
             // FLAC two-mixer setup is too complex for a partial restart; go live as a fallback.
+            // But NOT out of a paused buffer: goLive() + restartStream() is audible, so an
+            // interruption-ended or route-change reconnect while paused would blast audio the
+            // user never asked for. Leave the paused state alone — the buffer stops growing
+            // until the user acts, and goLive() already does the full FLAC restart on the next
+            // press. Silence-on-pause beats surprise playback.
+            guard dvrState != .paused else {
+                #if DEBUG
+                print("⏸️ FLAC partial restart skipped — buffer is paused, staying paused")
+                #endif
+                return
+            }
             DispatchQueue.main.async { self.goLive() }
             bassPollingQueue.async { self.restartStream() }
             return
@@ -760,9 +822,10 @@ extension BASSRadioPlayer {
     func startDVRRecordingPump() {
         stopDVRRecordingPump()
         guard preMixerHandle != 0 else { return }
+        dvrPumpTickCount = 0
+        dvrPumpDeadTickCount = 0
         #if DEBUG
         dvrPumpLastTick = Date()
-        dvrPumpTickCount = 0
         #endif
         let src = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
         src.schedule(deadline: .now() + 0.1, repeating: .milliseconds(100), leeway: .milliseconds(10))
@@ -778,11 +841,53 @@ extension BASSRadioPlayer {
                 print("⚠️ DVR pump gap of \(String(format: "%.1f", gap))s after \(self.dvrPumpTickCount) ticks (app likely suspended)")
             }
             self.dvrPumpLastTick = now
-            self.dvrPumpTickCount += 1
             #endif
+            self.dvrPumpTickCount += 1
             self.dvrRecordingPumpBuf.withUnsafeMutableBytes { ptr in
                 _ = BASS_ChannelGetData(self.preMixerHandle, ptr.baseAddress!, DWORD(ptr.count))
             }
+
+            // Dead-source detection. The pre-mixer carries BASS_MIXER_END, so it stops for good
+            // once the live download buffer runs dry (tunnel, Airplane Mode, dropped server).
+            // The pump then happily pulls nothing forever and the buffer stops growing with no
+            // other symptom. After ~1 s of consecutive STOPPED ticks, rebuild the live channel:
+            // partialRestartLiveChannel() preserves the DVR state and leaves the output mixer
+            // paused while we're .paused. Throttled to one attempt per 15 s so a genuinely
+            // offline device doesn't spin. preMixerHandle is re-read each tick, so the rebuilt
+            // handle is picked up automatically.
+            //
+            // Not for FLAC: partialRestartLiveChannel() can't rebuild the FLAC two-mixer
+            // pipeline in place and falls back to goLive() + a full restart, which would
+            // cancel the user's pause and start playing audio out loud — a nasty surprise
+            // from a backgrounded device. FLAC's dead-source case is still covered by
+            // checkStreamStatus while polling runs, and by the stale-resume gate on the
+            // next play press.
+            if BASS_ChannelIsActive(self.preMixerHandle) == DWORD(BASS_ACTIVE_STOPPED) {
+                self.dvrPumpDeadTickCount += 1
+            } else {
+                self.dvrPumpDeadTickCount = 0
+            }
+            if self.dvrPumpDeadTickCount >= 10, !self.isReconnecting, self.activeFormat != "FLAC" {
+                let now = ProcessInfo.processInfo.systemUptime
+                if now - self.dvrPumpLastRecoveryAttempt >= 15 {
+                    self.dvrPumpLastRecoveryAttempt = now
+                    self.dvrPumpDeadTickCount = 0
+                    #if DEBUG
+                    print("⚠️ DVR pump: pre-mixer STOPPED — partial restart of the live channel")
+                    #endif
+                    self.bassPollingQueue.async { [weak self] in self?.partialRestartLiveChannel() }
+                }
+            }
+            #if os(iOS)
+            // Keepalive health check, every ~10 s. An AVAudioPlayer can be stopped by the
+            // system without any notification we observe, and a dead keepalive means iOS
+            // suspends the app and freezes this very pump. Costs one main-queue hop per 10 s.
+            if self.dvrPumpTickCount % 100 == 0 {
+                DispatchQueue.main.async { [weak self] in
+                    self?.rearmSilenceKeepaliveIfNeeded()
+                }
+            }
+            #endif
         }
         src.resume()
         dvrRecordingPumpSource = src
