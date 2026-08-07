@@ -159,7 +159,9 @@ enum BASSConfig {
     var lastPositionAdvanceTime: TimeInterval = 0
 
     /// True only while the user intends playback to be active.
-    /// Set true in switchQuality(); false only in stop() / stopWithFadeOut().
+    /// Set true in switchQuality(); false in stop() / stopWithFadeOut(), and when
+    /// scheduleReconnect() exhausts its attempts (the state goes .stopped there, so the
+    /// intent must go with it or the auto-restart gates keep firing on a "stopped" app).
     /// freeStream() and restartStream() must NOT touch this.
     var isUserIntendedPlay: Bool = false
 

@@ -674,6 +674,17 @@ extension BASSRadioPlayer {
     func partialRestartLiveChannel() {
         guard activeFormat != "FLAC" else {
             // FLAC two-mixer setup is too complex for a partial restart; go live as a fallback.
+            // But NOT out of a paused buffer: goLive() + restartStream() is audible, so an
+            // interruption-ended or route-change reconnect while paused would blast audio the
+            // user never asked for. Leave the paused state alone — the buffer stops growing
+            // until the user acts, and goLive() already does the full FLAC restart on the next
+            // press. Silence-on-pause beats surprise playback.
+            guard dvrState != .paused else {
+                #if DEBUG
+                print("⏸️ FLAC partial restart skipped — buffer is paused, staying paused")
+                #endif
+                return
+            }
             DispatchQueue.main.async { self.goLive() }
             bassPollingQueue.async { self.restartStream() }
             return

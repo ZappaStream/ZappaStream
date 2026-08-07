@@ -1095,6 +1095,11 @@ extension BASSRadioPlayer {
             #if DEBUG
             print("❌ Reconnect giving up after \(reconnectMaxAttempts) attempts (~1 minute)")
             #endif
+            // Drop the intent with the state. Leaving it true made the UI say "stopped" while
+            // every auto-restart gate that reads isUserIntendedPlay (route change, foreground,
+            // interruption ended, network monitor) still passed — so a later AirPods event could
+            // start audio out of what the user saw as a stopped app.
+            isUserIntendedPlay = false
             DispatchQueue.main.async {
                 self.isReconnecting = false
                 self.playbackState = .stopped
