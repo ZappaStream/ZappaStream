@@ -53,6 +53,10 @@ class FZShowsDatabase {
         updateStats()
         log("Initialized — \(totalCachedShows) shows in database")
         DispatchQueue.main.async { [weak self] in self?.migrateRederivedSetlists() }
+        // Synchronous, unlike the setlist migration above: it only marks page
+        // records, and both callers invoke refreshStalePages() immediately after
+        // this init returns — deferring it would push the repair a launch late.
+        migrateUnknownVenues()
     }
 
     private func log(_ message: String) {
@@ -90,6 +94,44 @@ class FZShowsDatabase {
         }
         UserDefaults.standard.set(true, forKey: Self.rederiveSetlistsMigrationKey)
         log("Re-derived setlists for \(changedCount) of \(shows.count) cached show(s)")
+    }
+
+    /// Repairs shows cached under `FZShowsFetcher.unknownVenue` by an older venue
+    /// parser that only understood a hyphen separator, so every comma-separated
+    /// `<h4>` heading (all of 6970.html, plus scattered entries on 6669/7677/8182/88)
+    /// cached a placeholder venue. The source heading isn't retained, so the venue
+    /// can't be re-derived locally — the page has to be re-imported.
+    ///
+    /// Rather than downloading here, this marks the affected page records stale and
+    /// lets the existing `refreshStalePages()` launch pass do the fetch. That keeps
+    /// one download path, and self-retries for free: `lastFetchedAt` is only bumped
+    /// by `upsertPage` on a successful import, so an offline launch leaves the page
+    /// stale and it is picked up next time.
+    ///
+    /// The UserDefaults flag stops shows with a genuinely venue-less heading from
+    /// re-marking their page stale on every launch.
+    private static let unknownVenueMigrationKey = "didRepairUnknownVenues_v1"
+
+    private func migrateUnknownVenues() {
+        guard !UserDefaults.standard.bool(forKey: Self.unknownVenueMigrationKey) else { return }
+
+        let unknown = FZShowsFetcher.unknownVenue
+        let descriptor = FetchDescriptor<CachedFZShow>(
+            predicate: #Predicate { $0.venue == unknown }
+        )
+        let affected = (try? modelContext.fetch(descriptor)) ?? []
+        let pages = Set(affected.map(\.pageFilename)).subtracting([""])
+
+        if !pages.isEmpty {
+            let records = (try? modelContext.fetch(FetchDescriptor<FZShowsPageRecord>())) ?? []
+            for record in records where pages.contains(record.filename) {
+                record.lastFetchedAt = .distantPast
+            }
+            try? modelContext.save()
+            log("Venue repair — marked \(pages.count) page(s) stale for \(affected.count) show(s)")
+        }
+
+        UserDefaults.standard.set(true, forKey: Self.unknownVenueMigrationKey)
     }
 
     // MARK: - Lookup
