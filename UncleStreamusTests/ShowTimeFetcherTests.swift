@@ -461,6 +461,112 @@ final class ShowTimeFetcherTests: XCTestCase {
         XCTAssertEqual(show?.note, "This is a note about the show.")
     }
 
+    // MARK: - <h4 class="wrongdate"> section boundaries
+
+    /// The real markup around 1974 11 30 Naperville, IL. Zappateers marks "commonly
+    /// listed as" pointer entries with `<h4 class="wrongdate">`; the show-section end
+    /// pattern used to be bare-tag-only, so 1974 11 30 — which has no note of its own —
+    /// ran past the 1974 12 01 pointer entry and adopted its "See 1974 12 03." note.
+    private static let wrongdateEntryHTML = """
+    <h4>1974 11 29 - Field House, North Central College, Naperville, IL</h4>
+    <h6>60 min, SBD, A-</h6>
+    <p class="note">Strange mix, with Bird Legs' bass mixed way up front.</p>
+    <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Cosmik Debris</p>
+
+    <h4>1974 11 30 - Field House, North Central College, Naperville, IL</h4>
+    <h6>125 min, Aud, B+</h6>
+    <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Village Of The Sun</p>
+
+    <h4 class="wrongdate">1974 12 01 - Public Hall, Cleveland, OH</h4>
+    <p class="note">See 1974 12 03.</p>
+
+    <h4>1974 12 03 - Public Hall, Cleveland, OH</h4>
+    <p class="note">Usually listed as 1974 12 01, but this is the correct date.</p>
+    <h6>90 min, Aud, B-/C+</h6>
+    <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Dog Meat</p>
+    """
+
+    private func parseNaperville(_ date: String) -> FZShow? {
+        FZShowsFetcher.parseShowFromHTML(
+            html: Self.wrongdateEntryHTML, filename: "7374.html",
+            searchDate: date, originalDate: date,
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+    }
+
+    func testParseShowFromHTML_noteFromWrongdateEntryDoesNotBleed() {
+        let show = parseNaperville("1974 11 30")
+        XCTAssertNotNil(show)
+        XCTAssertNil(show?.note)
+    }
+
+    func testParseShowFromHTML_attributedH4BoundsSection() {
+        // The tighter boundary must not truncate the show's own content.
+        let show = parseNaperville("1974 11 30")
+        XCTAssertEqual(show?.showInfo, "125 min, Aud, B+")
+        XCTAssertEqual(show?.setlist, ["Tush Tush Tush", "Stinkfoot", "RDNZL", "Village Of The Sun"])
+        XCTAssertEqual(show?.venue, "Field House, North Central College, Naperville, IL")
+    }
+
+    func testParseShowFromHTML_ownNoteStillWinsBeforeWrongdateEntry() {
+        // 1974 11 29 has its own note and is followed by a note-bearing show, and
+        // 1974 12 03 has its own note while directly preceded by the pointer entry.
+        XCTAssertEqual(parseNaperville("1974 11 29")?.note,
+                       "Strange mix, with Bird Legs' bass mixed way up front.")
+        XCTAssertEqual(parseNaperville("1974 12 03")?.note,
+                       "Usually listed as 1974 12 01, but this is the correct date.")
+    }
+
+    func testImportAllShows_wrongdateEntryDoesNotLeakNoteToPreviousShow() {
+        // The offline cache goes through importAllShows, so assert the whole page at once.
+        let shows = FZShowsFetcher.importAllShows(
+            fromHTML: Self.wrongdateEntryHTML, filename: "7374.html", url: "https://example.com"
+        )
+        let notes = Dictionary(uniqueKeysWithValues: shows.map { ($0.date, $0.note) })
+
+        XCTAssertNil(notes["1974 11 30"] ?? nil)
+        XCTAssertEqual(notes["1974 11 29"] ?? nil,
+                       "Strange mix, with Bird Legs' bass mixed way up front.")
+        // The pointer entry is still imported under its own date — a tape circulated
+        // under the wrong date should find the cross-reference.
+        XCTAssertEqual(notes["1974 12 01"] ?? nil, "See 1974 12 03.")
+        XCTAssertEqual(notes["1974 12 03"] ?? nil,
+                       "Usually listed as 1974 12 01, but this is the correct date.")
+    }
+
+    func testParseShowFromHTML_earlyLateNotesStayWithTheirOwnSubsection() {
+        // 1974 10 31 Felt Forum: only the Late show carries a note. The fix must not be
+        // extended into parseNote by clamping at the setlist tag — that would drop this
+        // note, which sits after the Early setlist.
+        let html = """
+        <h4>1974 10 31 - Felt Forum, New York, NY</h4>
+        <h5>Early show</h5>
+        <h6>110 min, Aud, A-/B+</h6>
+        <p class="setlist">Tush Tush Tush, Stinkfoot, Inca Roads, Penguin In Bondage</p>
+        <h5>Late show</h5>
+        <h6>125 min, Aud, A-</h6>
+        <p class="note">With Lance Loud on vocals (*) and Bruce Fowler on trombone (**).</p>
+        <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Babbette</p>
+
+        <h4 class="wrongdate">1974 11 01 - Capital Centre, Landover, MD</h4>
+        <p class="note">See 1974 11 08.</p>
+
+        <h4>1974 11 08 - Next</h4>
+        """
+        func parse(_ time: ShowTime) -> FZShow? {
+            FZShowsFetcher.parseShowFromHTML(
+                html: html, filename: "7374.html",
+                searchDate: "1974 10 31", originalDate: "1974 10 31",
+                showTime: time, sectionKeywords: nil, url: "https://example.com"
+            )
+        }
+        XCTAssertNil(parse(.early)?.note)
+        XCTAssertEqual(parse(.late)?.note,
+                       "With Lance Loud on vocals (*) and Bruce Fowler on trombone (**).")
+        // The Late subsection ends at the page's next entry, not at the pointer entry's note.
+        XCTAssertEqual(parse(.late)?.setlist, ["Tush Tush Tush", "Stinkfoot", "RDNZL", "Babbette"])
+    }
+
     func testParseShowFromHTML_periodFromFilename() {
         let html = """
         <h4>1973 11 07 - Theater, Chicago, IL</h4>
@@ -697,5 +803,106 @@ final class ShowTimeFetcherTests: XCTestCase {
         )
         XCTAssertTrue(show?.bandInfo?.hasPrefix("The Mothers Of Invention, June - December 1974") ?? false)
         XCTAssertTrue(show?.bandInfo?.contains("Chester Thompson") ?? false)
+    }
+
+    // MARK: - Venue separator (comma vs dash)
+
+    /// Zappateers separates the date from the venue with " - " on most pages, but
+    /// 6970.html uses a comma for every entry and a handful of other pages carry one
+    /// comma entry each. The venue parser used to split on the first ASCII hyphen, so
+    /// a comma heading produced no venue at all and the show displayed "Unknown Venue".
+    /// Reported for 1970 03 07 Olympic Auditorium, Los Angeles, CA.
+    private func parseVenue(_ heading: String, searchDate: String,
+                            filename: String = "6970.html") -> FZShow? {
+        let html = """
+        \(heading)
+        <h6>60 min, AUD, B+</h6>
+        <p class="setlist">Song One, Song Two, Song Three</p>
+        <h4>1999 12 31 - Next</h4>
+        """
+        return FZShowsFetcher.parseShowFromHTML(
+            html: html, filename: filename,
+            searchDate: searchDate, originalDate: searchDate,
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+    }
+
+    func testExtractVenue_commaSeparatedHeading() {
+        // The reported show.
+        let show = parseVenue("<h4>1970 03 07, Olympic Auditorium, Los Angeles, CA</h4>",
+                              searchDate: "1970 03 07")
+        XCTAssertEqual(show?.venue, "Olympic Auditorium, Los Angeles, CA")
+    }
+
+    func testExtractVenue_commaHeadingAlsoResolvesLocation() {
+        // GeoData.parseLocation is fed the venue string, so the placeholder used to
+        // land in `city` too — breaking the tour/location filters for these shows.
+        let show = parseVenue("<h4>1970 03 07, Olympic Auditorium, Los Angeles, CA</h4>",
+                              searchDate: "1970 03 07")
+        XCTAssertEqual(show?.city, "Los Angeles")
+        XCTAssertEqual(show?.state, "CA")
+    }
+
+    func testExtractVenue_dashSeparatedHeadingUnchanged() {
+        let show = parseVenue("<h4>1973 11 07 - Orpheum Theater, Boston, MA</h4>",
+                              searchDate: "1973 11 07", filename: "7374.html")
+        XCTAssertEqual(show?.venue, "Orpheum Theater, Boston, MA")
+    }
+
+    func testExtractVenue_hyphenInsideDateRangeIsNotTheSeparator() {
+        // 6669.html: "1966 06 24-25? - Fillmore Auditorium…". Splitting on the first
+        // hyphen used to yield the junk venue "25? - Fillmore Auditorium, …".
+        let show = parseVenue("<h4>1966 06 24-25? - Fillmore Auditorium, San Francisco, CA</h4>",
+                              searchDate: "1966 06 24", filename: "6669.html")
+        XCTAssertEqual(show?.venue, "Fillmore Auditorium, San Francisco, CA")
+    }
+
+    func testExtractVenue_dateQualifiersBeforeCommaSeparator() {
+        // "?" and "or" qualifiers sit between the date and the separator.
+        XCTAssertEqual(
+            parseVenue("<h4>1968 10 23?, BBC Studios, London, UK</h4>",
+                       searchDate: "1968 10 23", filename: "6669.html")?.venue,
+            "BBC Studios, London, UK")
+        XCTAssertEqual(
+            parseVenue("<h4>1970 05 08 or 09, Fillmore East, New York, NY</h4>",
+                       searchDate: "1970 05 08")?.venue,
+            "Fillmore East, New York, NY")
+        // Also when the exceptions dict searches the full qualified date.
+        XCTAssertEqual(
+            parseVenue("<h4>1970 05 08 or 09, Fillmore East, New York, NY</h4>",
+                       searchDate: "1970 05 08 or 09")?.venue,
+            "Fillmore East, New York, NY")
+    }
+
+    func testExtractVenue_commaHeadingWithQuotedVenueKeepsWholeString() {
+        // Only the first separator splits, so a venue containing its own commas
+        // survives intact — matching how dash pages behave.
+        let show = parseVenue("<h4>1970 05 15, \"Contempo '70\", Pauley Pavilion, UCLA, Los Angeles, CA</h4>",
+                              searchDate: "1970 05 15")
+        XCTAssertEqual(show?.venue, "\"Contempo '70\", Pauley Pavilion, UCLA, Los Angeles, CA")
+    }
+
+    func testExtractVenue_attributedHeadingAndEntitySeparator() {
+        // <h4 class="wrongdate"> pointer entries are still imported under their own date.
+        XCTAssertEqual(
+            parseVenue("<h4 class=\"wrongdate\">1970 05 11, Fillmore East, New York, NY</h4>",
+                       searchDate: "1970 05 11")?.venue,
+            "Fillmore East, New York, NY")
+        // An &ndash; separator is decoded before the split, not after it.
+        XCTAssertEqual(
+            parseVenue("<h4>1970 06 18 &ndash; VPRO TV, Uddel, Netherlands</h4>",
+                       searchDate: "1970 06 18", filename: "7071.html")?.venue,
+            "VPRO TV, Uddel, Netherlands")
+        // Non-ASCII venue names survive the split (the real 8182.html heading uses a
+        // literal UTF-8 "ü", not an entity — decodeHTMLEntities has no &uuml; mapping).
+        XCTAssertEqual(
+            parseVenue("<h4>1982 06 26, Olympiahalle, München, Germany</h4>",
+                       searchDate: "1982 06 26", filename: "8182.html")?.venue,
+            "Olympiahalle, München, Germany")
+    }
+
+    func testExtractVenue_dateOnlyHeadingFallsBackToPlaceholder() {
+        let show = parseVenue("<h4>1970 03 07</h4>", searchDate: "1970 03 07")
+        XCTAssertEqual(show?.venue, FZShowsFetcher.unknownVenue)
     }
 }

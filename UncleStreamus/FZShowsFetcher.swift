@@ -88,9 +88,17 @@ class FZShowsFetcher {
         pattern: #"<acronym title="([^"]+)">([^<]+)</acronym>"#
     )
 
+    /// Placeholder used when a show's `<h4>` heading carries no venue at all.
+    /// Shared so `FZShowsDatabase` can find (and repair) rows cached under it.
+    static let unknownVenue = "Unknown Venue"
+
     /// Matches the next show's `<h4>` date header; used to bound one show's section.
+    /// Attribute-tolerant to match the section *start* patterns in `parseShowFromHTML`
+    /// and `importAllShows`: zappateers marks "commonly listed as" pointer entries with
+    /// `<h4 class="wrongdate">`, and a bare-tag pattern let one show's section run past
+    /// such an entry, so a note-less show picked up the pointer entry's note.
     /// Single source of truth — referenced from both section-scanning sites.
-    private static let nextShowDatePattern = #"<h4>\d{4} \d{2} \d{2}"#
+    private static let nextShowDatePattern = #"<h4[^>]*>\s*\d{4} \d{2} \d{2}"#
 
     /// Matches `<h3>` inner text (tour/title lines on 1970–71 style pages).
     /// Hoisted to avoid recompiling on every tour-name extraction.
@@ -509,8 +517,8 @@ class FZShowsFetcher {
         print("🏟️ FULL h4: '\(fullH4)'")
         #endif
 
-        var venue = "Unknown Venue"
-        if let parsedVenue = extractVenue(fromH4: fullH4) {
+        var venue = Self.unknownVenue
+        if let parsedVenue = extractVenue(fromH4: fullH4, searchDate: searchDate) {
             venue = parsedVenue
             #if DEBUG
             print("🏟️ Venue: '\(venue)'")
@@ -596,15 +604,36 @@ class FZShowsFetcher {
 
     // MARK: - parseShowFromHTML Helpers
 
-    /// Parses the venue name from a show's full `<h4>` heading (the text after the
-    /// dash). Returns nil when the heading has no dash.
-    private static func extractVenue(fromH4 fullH4: String) -> String? {
-        guard let dashIndex = fullH4.firstIndex(of: "-") else { return nil }
-        let afterDash = fullH4[fullH4.index(after: dashIndex)..<fullH4.endIndex]
-        return String(afterDash)
+    /// Separator between the date and the venue in an `<h4>` heading. Most pages
+    /// use " - ", but 6970.html uses a comma for every entry and a handful of
+    /// other pages carry one comma entry each (1968 10 23 BBC Studios,
+    /// 1976 10 18 Vanderbilt, 1982 06 26 Olympiahalle, 1988 05 03 Ahoy).
+    /// Requiring whitespace around the dash keeps a hyphen *inside* a date range
+    /// ("1966 06 24-25? - Fillmore…") from being mistaken for the separator.
+    private static let venueSeparatorPattern = #"\s[-–—]\s|,"#
+
+    /// Parses the venue name from a show's full `<h4>` heading — everything after
+    /// the separator that follows the date. Returns nil for a date-only heading.
+    private static func extractVenue(fromH4 fullH4: String, searchDate: String) -> String? {
+        // Strip tags and decode entities *first*, so an `&ndash;`/`&mdash;`
+        // separator is visible to the scan below.
+        let text = fullH4
             .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
             .decodeHTMLEntities()
             .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // The heading always starts with `searchDate` (`h4Pattern` matched it
+        // there), so drop it before scanning for the separator.
+        var remainder = Substring(text)
+        if remainder.hasPrefix(searchDate) {
+            remainder = remainder.dropFirst(searchDate.count)
+        }
+
+        guard let sep = remainder.range(of: Self.venueSeparatorPattern,
+                                        options: .regularExpression) else { return nil }
+        let venue = remainder[sep.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return venue.isEmpty ? nil : venue
     }
 
     /// Selects the subsection of a show's HTML matching the requested show time.
@@ -748,12 +777,19 @@ class FZShowsFetcher {
         if let pEnd = targetSection.range(of: "</p>", range: searchFrom..<targetSection.endIndex) {
             setlistEndIndex = pEnd.lowerBound
         }
-        for heading in ["<h5>", "<h4>"] {
-            if let hRange = targetSection.range(of: heading, range: searchFrom..<targetSection.endIndex) {
-                if setlistEndIndex == nil || hRange.lowerBound < setlistEndIndex! {
-                    setlistEndIndex = hRange.lowerBound
-                }
+        func clampEnd(to index: String.Index) {
+            if setlistEndIndex == nil || index < setlistEndIndex! {
+                setlistEndIndex = index
             }
+        }
+        if let h5Range = targetSection.range(of: "<h5>", range: searchFrom..<targetSection.endIndex) {
+            clampEnd(to: h5Range.lowerBound)
+        }
+        // Attribute-tolerant, matching `nextShowDatePattern`: an unclosed setlist tag must
+        // not swallow a following `<h4 class="wrongdate">` pointer entry.
+        if let h4Range = targetSection.range(of: #"<h4[^>]*>"#, options: .regularExpression,
+                                             range: searchFrom..<targetSection.endIndex) {
+            clampEnd(to: h4Range.lowerBound)
         }
         let finalSetlistEndIndex = setlistEndIndex ?? targetSection.endIndex
 
