@@ -461,6 +461,112 @@ final class ShowTimeFetcherTests: XCTestCase {
         XCTAssertEqual(show?.note, "This is a note about the show.")
     }
 
+    // MARK: - <h4 class="wrongdate"> section boundaries
+
+    /// The real markup around 1974 11 30 Naperville, IL. Zappateers marks "commonly
+    /// listed as" pointer entries with `<h4 class="wrongdate">`; the show-section end
+    /// pattern used to be bare-tag-only, so 1974 11 30 — which has no note of its own —
+    /// ran past the 1974 12 01 pointer entry and adopted its "See 1974 12 03." note.
+    private static let wrongdateEntryHTML = """
+    <h4>1974 11 29 - Field House, North Central College, Naperville, IL</h4>
+    <h6>60 min, SBD, A-</h6>
+    <p class="note">Strange mix, with Bird Legs' bass mixed way up front.</p>
+    <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Cosmik Debris</p>
+
+    <h4>1974 11 30 - Field House, North Central College, Naperville, IL</h4>
+    <h6>125 min, Aud, B+</h6>
+    <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Village Of The Sun</p>
+
+    <h4 class="wrongdate">1974 12 01 - Public Hall, Cleveland, OH</h4>
+    <p class="note">See 1974 12 03.</p>
+
+    <h4>1974 12 03 - Public Hall, Cleveland, OH</h4>
+    <p class="note">Usually listed as 1974 12 01, but this is the correct date.</p>
+    <h6>90 min, Aud, B-/C+</h6>
+    <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Dog Meat</p>
+    """
+
+    private func parseNaperville(_ date: String) -> FZShow? {
+        FZShowsFetcher.parseShowFromHTML(
+            html: Self.wrongdateEntryHTML, filename: "7374.html",
+            searchDate: date, originalDate: date,
+            showTime: .none, sectionKeywords: nil, url: "https://example.com"
+        )
+    }
+
+    func testParseShowFromHTML_noteFromWrongdateEntryDoesNotBleed() {
+        let show = parseNaperville("1974 11 30")
+        XCTAssertNotNil(show)
+        XCTAssertNil(show?.note)
+    }
+
+    func testParseShowFromHTML_attributedH4BoundsSection() {
+        // The tighter boundary must not truncate the show's own content.
+        let show = parseNaperville("1974 11 30")
+        XCTAssertEqual(show?.showInfo, "125 min, Aud, B+")
+        XCTAssertEqual(show?.setlist, ["Tush Tush Tush", "Stinkfoot", "RDNZL", "Village Of The Sun"])
+        XCTAssertEqual(show?.venue, "Field House, North Central College, Naperville, IL")
+    }
+
+    func testParseShowFromHTML_ownNoteStillWinsBeforeWrongdateEntry() {
+        // 1974 11 29 has its own note and is followed by a note-bearing show, and
+        // 1974 12 03 has its own note while directly preceded by the pointer entry.
+        XCTAssertEqual(parseNaperville("1974 11 29")?.note,
+                       "Strange mix, with Bird Legs' bass mixed way up front.")
+        XCTAssertEqual(parseNaperville("1974 12 03")?.note,
+                       "Usually listed as 1974 12 01, but this is the correct date.")
+    }
+
+    func testImportAllShows_wrongdateEntryDoesNotLeakNoteToPreviousShow() {
+        // The offline cache goes through importAllShows, so assert the whole page at once.
+        let shows = FZShowsFetcher.importAllShows(
+            fromHTML: Self.wrongdateEntryHTML, filename: "7374.html", url: "https://example.com"
+        )
+        let notes = Dictionary(uniqueKeysWithValues: shows.map { ($0.date, $0.note) })
+
+        XCTAssertNil(notes["1974 11 30"] ?? nil)
+        XCTAssertEqual(notes["1974 11 29"] ?? nil,
+                       "Strange mix, with Bird Legs' bass mixed way up front.")
+        // The pointer entry is still imported under its own date — a tape circulated
+        // under the wrong date should find the cross-reference.
+        XCTAssertEqual(notes["1974 12 01"] ?? nil, "See 1974 12 03.")
+        XCTAssertEqual(notes["1974 12 03"] ?? nil,
+                       "Usually listed as 1974 12 01, but this is the correct date.")
+    }
+
+    func testParseShowFromHTML_earlyLateNotesStayWithTheirOwnSubsection() {
+        // 1974 10 31 Felt Forum: only the Late show carries a note. The fix must not be
+        // extended into parseNote by clamping at the setlist tag — that would drop this
+        // note, which sits after the Early setlist.
+        let html = """
+        <h4>1974 10 31 - Felt Forum, New York, NY</h4>
+        <h5>Early show</h5>
+        <h6>110 min, Aud, A-/B+</h6>
+        <p class="setlist">Tush Tush Tush, Stinkfoot, Inca Roads, Penguin In Bondage</p>
+        <h5>Late show</h5>
+        <h6>125 min, Aud, A-</h6>
+        <p class="note">With Lance Loud on vocals (*) and Bruce Fowler on trombone (**).</p>
+        <p class="setlist">Tush Tush Tush, Stinkfoot, RDNZL, Babbette</p>
+
+        <h4 class="wrongdate">1974 11 01 - Capital Centre, Landover, MD</h4>
+        <p class="note">See 1974 11 08.</p>
+
+        <h4>1974 11 08 - Next</h4>
+        """
+        func parse(_ time: ShowTime) -> FZShow? {
+            FZShowsFetcher.parseShowFromHTML(
+                html: html, filename: "7374.html",
+                searchDate: "1974 10 31", originalDate: "1974 10 31",
+                showTime: time, sectionKeywords: nil, url: "https://example.com"
+            )
+        }
+        XCTAssertNil(parse(.early)?.note)
+        XCTAssertEqual(parse(.late)?.note,
+                       "With Lance Loud on vocals (*) and Bruce Fowler on trombone (**).")
+        // The Late subsection ends at the page's next entry, not at the pointer entry's note.
+        XCTAssertEqual(parse(.late)?.setlist, ["Tush Tush Tush", "Stinkfoot", "RDNZL", "Babbette"])
+    }
+
     func testParseShowFromHTML_periodFromFilename() {
         let html = """
         <h4>1973 11 07 - Theater, Chicago, IL</h4>

@@ -89,8 +89,12 @@ class FZShowsFetcher {
     )
 
     /// Matches the next show's `<h4>` date header; used to bound one show's section.
+    /// Attribute-tolerant to match the section *start* patterns in `parseShowFromHTML`
+    /// and `importAllShows`: zappateers marks "commonly listed as" pointer entries with
+    /// `<h4 class="wrongdate">`, and a bare-tag pattern let one show's section run past
+    /// such an entry, so a note-less show picked up the pointer entry's note.
     /// Single source of truth — referenced from both section-scanning sites.
-    private static let nextShowDatePattern = #"<h4>\d{4} \d{2} \d{2}"#
+    private static let nextShowDatePattern = #"<h4[^>]*>\s*\d{4} \d{2} \d{2}"#
 
     /// Matches `<h3>` inner text (tour/title lines on 1970–71 style pages).
     /// Hoisted to avoid recompiling on every tour-name extraction.
@@ -748,12 +752,19 @@ class FZShowsFetcher {
         if let pEnd = targetSection.range(of: "</p>", range: searchFrom..<targetSection.endIndex) {
             setlistEndIndex = pEnd.lowerBound
         }
-        for heading in ["<h5>", "<h4>"] {
-            if let hRange = targetSection.range(of: heading, range: searchFrom..<targetSection.endIndex) {
-                if setlistEndIndex == nil || hRange.lowerBound < setlistEndIndex! {
-                    setlistEndIndex = hRange.lowerBound
-                }
+        func clampEnd(to index: String.Index) {
+            if setlistEndIndex == nil || index < setlistEndIndex! {
+                setlistEndIndex = index
             }
+        }
+        if let h5Range = targetSection.range(of: "<h5>", range: searchFrom..<targetSection.endIndex) {
+            clampEnd(to: h5Range.lowerBound)
+        }
+        // Attribute-tolerant, matching `nextShowDatePattern`: an unclosed setlist tag must
+        // not swallow a following `<h4 class="wrongdate">` pointer entry.
+        if let h4Range = targetSection.range(of: #"<h4[^>]*>"#, options: .regularExpression,
+                                             range: searchFrom..<targetSection.endIndex) {
+            clampEnd(to: h4Range.lowerBound)
         }
         let finalSetlistEndIndex = setlistEndIndex ?? targetSection.endIndex
 
